@@ -2,7 +2,9 @@
 .env
 
 # Local-only dev/maintenance scripts
-scripts/
+scripts/data/
+scripts/results/
+scripts/_to_delete/
 
 # Python
 __pycache__/

@@ -1,0 +1,46 @@
+{
+  "schema_version": "1.0",
+  "event_id": "11111111-1111-1111-1111-111111111111",
+  "generated_at": "2026-10-05T21:30:00Z",
+  "items": [
+    {
+      "id": "earnings-call-facts",
+      "kind": "facts",
+      "source": "earnings_call",
+      "media_type": "application/json",
+      "content": [
+        "Revenue rose 12% year over year.",
+        "Full-year guidance was raised."
+      ]
+    },
+    {
+      "id": "earnings-preview",
+      "kind": "text",
+      "source": "claude_code_web_research",
+      "media_type": "text/markdown",
+      "content": "# Acme (ACME) \u2014 Q3 FY2026 Earnings Preview\n\n## Consensus Estimates\nEPS $1.20\n"
+    },
+    {
+      "id": "option-implied-stats",
+      "kind": "stats",
+      "source": "option_market",
+      "media_type": "application/json",
+      "content": {
+        "as_of": "2026-10-05T19:36:12Z",
+        "methodology": "v1",
+        "implied_earnings_volatility": {
+          "value": 0.0847,
+          "status": "ok"
+        },
+        "implied_absolute_earnings_move": {
+          "value": 0.0676,
+          "status": "ok"
+        },
+        "skew_25_delta": {
+          "value": -0.0412,
+          "status": "ok"
+        }
+      }
+    }
+  ]
+}
