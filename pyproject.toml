@@ -13,6 +13,9 @@ dependencies = [
     "pydantic>=2.6",
     # Needed locally so `modal deploy` can read .env via Secret.from_dotenv.
     "python-dotenv>=1.0",
+    "langchain-core>=1.7.3",
+    "langchain-openai>=1.7.3",
+    "akshare>=1.18.88",
 ]
 
 [dependency-groups]
