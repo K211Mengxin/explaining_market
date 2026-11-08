@@ -167,7 +167,7 @@ def write_bundle(store: Store, tickers: list[str]) -> None:
     out = store.path("bundle")
     out.mkdir(parents=True, exist_ok=True)
     built = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    for name in ("profiles.json.gz", "facts_all.json.gz", "history.json.gz"):
+    for name in ("profiles.json.gz", "facts_all.json.gz", "history.json.gz", "combiner.json"):
         src = store.path(*BUNDLE_FILES[name])
         if src.exists():
             shutil.copyfile(src, out / name)

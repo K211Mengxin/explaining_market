@@ -230,6 +230,9 @@ def run_one(row: dict) -> dict:
         row["trace"] = trace
         row["fallback"] = trace.get("fallback")
         row["reason"] = trace.get("reason")
+        row["mode"] = trace.get("mode")
+        row["questionnaire_error"] = trace.get("questionnaire_error") or trace.get("combiner_error")
+        row["q_overall"] = (trace.get("questionnaire") or {}).get("overall")
         row["context_errors"] = "; ".join(f"{k}: {v}" for k, v in (trace.get("context_errors") or {}).items())
         row["context_seconds"] = (trace.get("timings") or {}).get("total")
         for k in CONTEXT_COLS:
@@ -303,6 +306,16 @@ def main() -> None:
     if not os.environ.get("DEEPSEEK_API_KEY"):
         print("[!] DEEPSEEK_API_KEY not set: every prediction will be the 0.5 baseline")
     settings = AgentSettings.from_env()
+    combiner = P.load_combiner(settings.combiner_file) if settings.use_combiner else None
+    if combiner is not None:
+        trained_on = combiner.meta.get("quarters") or []
+        print(f"mode: questionnaire + combiner ({settings.combiner_file}, trained on {trained_on})")
+        if path.name and any(q in path.name for q in trained_on):
+            print("[!] this quarter was in the combiner's training data: the score below is IN-SAMPLE "
+                  "(optimistic). Use the cross-validated numbers from train_combiner.py instead, "
+                  "or set AGENT_USE_COMBINER=0 to backtest the single-score chain.")
+    else:
+        print("mode: single-score chain (no combiner file, or AGENT_USE_COMBINER=0)")
     print(f"predicting {len(sample)} events: {settings.describe()}, {args.workers} workers ...\n")
 
     done = 0
@@ -328,8 +341,8 @@ def main() -> None:
     OUT_DIR.mkdir(exist_ok=True)
     out = OUT_DIR / f"backtest_{path.name.removesuffix('.jsonl.gz')}_{time.strftime('%Y%m%d_%H%M%S')}.csv"
     cols = ["event_id", "ticker", "event_datetime", "pred", "y", "car1", "surprise",
-            "surprise_pct", *BASELINES.values(), *CONTEXT_COLS, "reason", "fallback",
-            "context_errors", "context_seconds", "seconds", "error"]
+            "surprise_pct", *BASELINES.values(), *CONTEXT_COLS, "mode", "q_overall", "reason", "fallback",
+            "questionnaire_error", "context_errors", "context_seconds", "seconds", "error"]
     with out.open("w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
         w.writeheader()

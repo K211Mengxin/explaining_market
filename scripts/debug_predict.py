@@ -98,9 +98,19 @@ def main() -> None:
         print("\ntimings:", trace["timings"])
     if trace.get("context_errors"):
         print("errors:", json.dumps(trace["context_errors"], indent=2))
-    rule("CHAIN")
-    print(f"reason: {trace.get('reason')!r}  llm={trace.get('llm_seconds')}s"
-          + (f"\nFALLBACK: {trace['fallback']}" if trace.get("fallback") else ""))
+    if str(trace.get("mode", "")).startswith("combiner"):
+        rule("QUESTIONNAIRE + COMBINER")
+        print("answers:", json.dumps(trace.get("questionnaire"), indent=2))
+        if trace.get("questionnaire_error"):
+            print("questionnaire error:", trace["questionnaire_error"])
+        print("features:", json.dumps({k: v for k, v in (trace.get("features") or {}).items() if v is not None},
+                                      indent=2))
+        print(f"combiner: {trace.get('combiner')}  llm={trace.get('llm_seconds')}s")
+    else:
+        rule(f"CHAIN ({trace.get('mode', 'chain')})")
+        print(f"reason: {trace.get('reason')!r}  llm={trace.get('llm_seconds')}s"
+              + (f"\nCOMBINER ERROR: {trace['combiner_error']}" if trace.get("combiner_error") else "")
+              + (f"\nFALLBACK: {trace['fallback']}" if trace.get("fallback") else ""))
     rule("PREDICTION")
     print(json.dumps(preds, indent=2))
     if outcome:
