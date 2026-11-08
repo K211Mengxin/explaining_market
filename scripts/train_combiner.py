@@ -58,6 +58,10 @@ ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(HERE))
 
+from dotenv import load_dotenv  # noqa: E402
+
+load_dotenv(ROOT / ".env")  # DEEPSEEK_API_KEY, EM_API_KEY, SEC_USER_AGENT, like the other scripts
+
 import predict as P  # noqa: E402
 from predict import (  # noqa: E402
     FEATURE_NAMES, MAGNITUDE_KEYS, QUESTIONNAIRE_VERSION, AgentSettings, Combiner, feature_row, magnitude_inputs,
