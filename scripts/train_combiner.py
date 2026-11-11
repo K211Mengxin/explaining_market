@@ -11,6 +11,8 @@ store, see scripts/build_store.py):
     uv run python scripts/train_combiner.py --quarters 2026Q3 --limit 200   # a cheap first look
     uv run python scripts/train_combiner.py                              # every quarter, every event
     uv run python scripts/train_combiner.py --fit-only                   # refit from the cache only
+    uv run python scripts/train_combiner.py --quarters 2025Q4,2026Q1,2026Q2 --limit 200 \\
+        --holdout 2026Q3 --holdout-limit 600                             # train on three, test on Q3
     uv run modal volume put em-agent-store scripts/data/bundle /bundle --force   # ship it
 
 Steps
@@ -214,7 +216,9 @@ def _slug(text: str) -> str:
 
 
 def questionnaire_cache(settings: AgentSettings) -> JsonlCache:
-    name = f"questionnaire_{QUESTIONNAIRE_VERSION}_{_slug(settings.deepseek_model)}_n{settings.questionnaire_samples}.jsonl"
+    name = (f"questionnaire_{QUESTIONNAIRE_VERSION}_{_slug(settings.deepseek_model)}"
+            f"_n{settings.questionnaire_samples}_think-{settings.questionnaire_thinking}"
+            f"_prev{settings.questionnaire_preview_chars}.jsonl")
     return JsonlCache(CACHE_DIR / name)
 
 
@@ -254,7 +258,7 @@ def extract_one(row: dict, settings: AgentSettings, qcache: JsonlCache | None, c
     if qcache is not None:
         q = qcache.get(key)
         if q is None and ask:
-            materials = P._materials_text(rec["disclosure"])
+            materials = P.questionnaire_materials(rec["disclosure"], settings.questionnaire_preview_chars)
             name = (P.get_data(settings).sec.profiles().get(ticker.upper()) or {}).get("name")
             fn = questionnaire_fn or P.run_questionnaire
             try:
@@ -454,6 +458,17 @@ def cross_validate(rows: list[dict], names: list[str], lambdas, seed: int, power
 # ---------------------------------------------------------------------- main ---
 
 
+def sample_rows(rows: list[dict], quarter: str, limit: int, seed: int) -> list[dict]:
+    """`limit` rows of a quarter, NESTED: a larger limit keeps every row of a smaller one, and a
+    quarter's sample does not depend on which other quarters are requested. So a run can be
+    extended (--limit 150 -> 300) and every questionnaire answer already paid for is reused."""
+    if not limit or len(rows) <= limit:
+        return rows
+    order = sorted(rows, key=lambda r: (r["event_id"], r["ticker"]))
+    random.Random(f"{seed}|{quarter}").shuffle(order)
+    return order[:limit]
+
+
 def load_quarters(args) -> list[tuple[str, list[dict]]]:
     from backtest import download, list_quarters, read_records  # noqa: E402  (needs EM_API_KEY)
 
@@ -461,6 +476,8 @@ def load_quarters(args) -> list[tuple[str, list[dict]]]:
         return [(quarter_of(p), read_records(p)) for p in args.files]
     files = [f for f in list_quarters() if f["event_type"] == args.event_type]
     wanted = set(args.quarters.split(",")) if args.quarters else {f["quarter"] for f in files}
+    if args.holdout:
+        wanted.add(args.holdout)
     return [(f["quarter"], read_records(download(args.event_type, f["quarter"])))
             for f in files if f["quarter"] in wanted]
 
@@ -486,6 +503,43 @@ def report_baselines(rows: list[dict]) -> None:
                 print(f"  {label:<28} n={len(use):<5} mean per-quarter dR2={np.mean(vals):+.4f} (in-sample, untrained)")
 
 
+def _bootstrap(fn, n: int, seed: int, reps: int = 1000) -> tuple[float, float] | None:
+    """5th and 95th percentile of fn(resampled row indices) over `reps` resamples of n rows."""
+    rng = np.random.default_rng(seed)
+    vals = [v for _ in range(reps) if (v := fn(rng.integers(0, n, n))) is not None]
+    return (float(np.percentile(vals, 5)), float(np.percentile(vals, 95))) if len(vals) >= reps // 2 else None
+
+
+def report_holdout(combiner: Combiner, hold: list[dict], seed: int) -> dict:
+    """Score the fitted combiner on a quarter it never saw (not for fitting, not for choosing
+    lambda or the exponent), next to the official baselines on the same rows."""
+    pred = predict_rows(combiner, hold)
+    s, y = np.array([r["s"] for r in hold]), np.array([r["y"] for r in hold])
+    d = delta_r2(pred, s, y)
+    ci = _bootstrap(lambda i: delta_r2(pred[i], s[i], y[i]), len(hold), seed)
+    out: dict = {"quarter": hold[0]["quarter"], "n": len(hold), "delta_r2": d, "ci90": ci, "baselines": {}}
+    span = f"   90% interval [{ci[0]:+.4f}, {ci[1]:+.4f}]" if ci else ""
+    print(f"\nHOLDOUT {out['quarter']} (never used for fitting or tuning), n={len(hold)}:")
+    print(f"  {'combiner':<28} dR2={d:+.4f}{span}")
+    for col in BASELINES.values():
+        keep = np.array([i for i, r in enumerate(hold) if r.get(col) is not None], dtype=int)
+        if len(keep) < 10:
+            continue
+        b, p_k, s_k, y_k = np.array([hold[i][col] for i in keep], dtype=float), pred[keep], s[keep], y[keep]
+        d_b = delta_r2(b, s_k, y_k)
+
+        def diff(i, b=b, p_k=p_k, s_k=s_k, y_k=y_k):
+            mine, theirs = delta_r2(p_k[i], s_k[i], y_k[i]), delta_r2(b[i], s_k[i], y_k[i])
+            return None if mine is None or theirs is None else mine - theirs
+
+        ci_d = _bootstrap(diff, len(keep), seed)
+        out["baselines"][col] = {"n": int(len(keep)), "delta_r2": d_b, "combiner_minus_baseline_ci90": ci_d}
+        span = f"   combiner minus it: 90% interval [{ci_d[0]:+.4f}, {ci_d[1]:+.4f}]" if ci_d else ""
+        print(f"  {col:<28} dR2={d_b:+.4f}{span}")
+    print("  (an interval for the difference that excludes 0 means the two really differ on these events)")
+    return out
+
+
 def main(argv: list[str] | None = None, *, questionnaire_fn=None) -> Combiner | None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--list", action="store_true", help="list archive quarters and exit")
@@ -493,6 +547,9 @@ def main(argv: list[str] | None = None, *, questionnaire_fn=None) -> Combiner | 
     ap.add_argument("--files", type=Path, nargs="*", help="local archive .jsonl.gz files instead of the API")
     ap.add_argument("--event-type", default="EARNINGS_RELEASE")
     ap.add_argument("--limit", type=int, default=0, help="events sampled per quarter (0 = all)")
+    ap.add_argument("--holdout", help="a quarter kept out of fitting AND tuning, scored at the end, e.g. 2026Q3")
+    ap.add_argument("--holdout-limit", type=int, default=None,
+                    help="events sampled from the holdout quarter (default: --limit)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--lambdas", default=",".join(map(str, DEFAULT_LAMBDAS)))
@@ -522,26 +579,37 @@ def main(argv: list[str] | None = None, *, questionnaire_fn=None) -> Combiner | 
 
     # 1-2. archive and targets
     rows: list[dict] = []
-    rng = random.Random(args.seed)
+    hold_limit = args.limit if args.holdout_limit is None else args.holdout_limit
     for quarter, records in load_quarters(args):
-        q_rows = trainable(outcome_rows(records, quarter))
-        if args.limit and len(q_rows) > args.limit:
-            q_rows = rng.sample(q_rows, args.limit)
-        print(f"{quarter}: {len(q_rows)} trainable outcomes")
+        is_hold = quarter == args.holdout
+        q_rows = sample_rows(trainable(outcome_rows(records, quarter)), quarter,
+                             hold_limit if is_hold else args.limit, args.seed)
+        print(f"{quarter}: {len(q_rows)} trainable outcomes" + ("  [HOLDOUT]" if is_hold else ""))
         rows.extend(q_rows)
-    if not rows:
+    if not [r for r in rows if r["quarter"] != args.holdout]:
         sys.exit("no trainable outcomes (need a car1, a surprise and a disclosure)")
+    if args.holdout and not [r for r in rows if r["quarter"] == args.holdout]:
+        sys.exit(f"holdout quarter {args.holdout} has no usable outcomes (check --list / --files)")
 
     # 3. extract
     print(f"extracting features for {len(rows)} outcomes "
           f"(questionnaire {QUESTIONNAIRE_VERSION if use_q else 'off'}, model {settings.deepseek_model}, "
-          f"samples {settings.questionnaire_samples}) ...")
+          f"samples {settings.questionnaire_samples}, thinking {settings.questionnaire_thinking}, "
+          f"preview {settings.questionnaire_preview_chars} chars) ...")
     data = extract_all(rows, settings, workers=args.workers, ask=not args.fit_only, use_questionnaire=use_q,
                        refresh_context=args.refresh_context, questionnaire_fn=questionnaire_fn)
     failed = sum(1 for r in data if use_q and r["features"].get("q_overall") is None)
     print(f"{len(data)} rows ready; questionnaire missing on {failed}")
+    u = P.QUESTIONNAIRE_USAGE
+    if u["calls"]:
+        n = u["calls"]
+        print(f"questionnaire API usage this run: {n} calls (thinking {settings.questionnaire_thinking}); per call: "
+              f"{u['prompt'] / n:.0f} input tokens ({u['cache_hit'] / n:.0f} from cache), "
+              f"{u['completion'] / n:.0f} output tokens ({u['reasoning'] / n:.0f} of them reasoning)")
 
-    # 4. fit
+    # 4. fit (the holdout quarter, if any, is set aside until the very end)
+    hold = [r for r in data if r["quarter"] == args.holdout]
+    data = [r for r in data if r["quarter"] != args.holdout]
     names, coverage = choose_features(data, args.min_coverage)
     lambdas = [float(x) for x in args.lambdas.split(",") if x.strip()]
     powers = [float(x) for x in args.powers.split(",") if x.strip()]
@@ -564,6 +632,8 @@ def main(argv: list[str] | None = None, *, questionnaire_fn=None) -> Combiner | 
     meta = {"trained_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "quarters": sorted({r["quarter"] for r in data}), "n_rows": len(data),
             "model": settings.deepseek_model, "questionnaire_samples": settings.questionnaire_samples,
+            "questionnaire_thinking": settings.questionnaire_thinking,
+            "questionnaire_preview_chars": settings.questionnaire_preview_chars,
             "lambda": cv["lambda"], "cv": cv, "coverage": {n: round(coverage[n], 3) for n in names},
             "dropped": sorted(set(FEATURE_NAMES) - set(names))}
     meta["magnitude_power"], meta["magnitude_joint"] = cv["power"], cv["joint"]
@@ -576,6 +646,8 @@ def main(argv: list[str] | None = None, *, questionnaire_fn=None) -> Combiner | 
         print(f"magnitude: base={combiner.magnitude['base']} ratios={combiner.magnitude['ratios']} "
               f"ref={combiner.magnitude['ref']:.4f} power={combiner.magnitude['power']}")
     print(f"in-sample delta R^2 (optimistic): {score(predict_rows(combiner, data), data):+.4f}")
+    if hold:
+        meta["holdout"] = report_holdout(combiner, hold, args.seed)
 
     # 5. save
     args.out.parent.mkdir(parents=True, exist_ok=True)

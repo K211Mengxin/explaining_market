@@ -64,6 +64,34 @@ def test_prompt_asks_for_numbers_without_computing() -> None:
     assert "Do not compute" in P.QUESTIONNAIRE_SYSTEM
 
 
+def test_questionnaire_reads_a_shorter_text_with_the_fixed_part_first() -> None:
+    bundle = {"items": [
+        {"id": "earnings-call-facts", "kind": "facts", "content": ["Revenue up 12%."]},
+        {"id": "option-implied-stats", "kind": "stats", "content": {
+            "implied_earnings_volatility": {"value": 0.07, "status": "ok"}}},
+        {"id": "earnings-preview", "kind": "preview", "content": "P" * 9000},
+    ]}
+    full, short = P.format_materials(bundle), P.questionnaire_materials(bundle, 3000)
+    assert "Implied earnings volatility" in full and "Implied earnings volatility" not in short
+    assert "P" * 3000 in short and "P" * 3001 not in short
+    assert "P" * 8000 in P.questionnaire_materials(bundle)             # default: the chain's cut
+    assert "Revenue up 12%." in short and len(short) < len(full) / 2
+    assert P.questionnaire_materials(None) == ""
+    # every prompt starts with the same text (cache-friendly); materials come last
+    a, b = P.questionnaire_prompt("event A"), P.questionnaire_prompt("event B")
+    prefix = a[: a.index("=== EVENT MATERIALS ===")]
+    assert b.startswith(prefix) and a.rstrip().endswith("=== END ===")
+
+
+def test_sampling_is_nested_and_independent_of_other_quarters() -> None:
+    rows = [{"event_id": f"e{i}", "ticker": "T"} for i in range(500)]
+    small, large = T.sample_rows(rows, "2026Q3", 100, 0), T.sample_rows(rows, "2026Q3", 250, 0)
+    assert len(small) == 100 and large[:100] == small                   # a bigger run reuses the smaller one
+    assert T.sample_rows(list(reversed(rows)), "2026Q3", 100, 0) == small   # input order does not matter
+    assert T.sample_rows(rows, "2026Q2", 100, 0) != small and T.sample_rows(rows, "2026Q3", 100, 1) != small
+    assert T.sample_rows(rows, "2026Q3", 0, 0) == rows and T.sample_rows(rows[:50], "2026Q3", 100, 0) == rows[:50]
+
+
 def test_average_answers_takes_the_median_of_numbers() -> None:
     blank = {k: None for k in (*QUESTION_KEYS, *P.NUMBER_KEYS)} | {"guidance_metric": None}
     replies = [blank | {"revenue_actual": 5.1, "guidance_metric": "revenue"},
@@ -117,6 +145,38 @@ def test_run_questionnaire_hides_the_company_and_uses_json_mode() -> None:
     prompt = call["messages"][1]["content"]
     assert "ADSK" not in prompt and "Autodesk" not in prompt and "raised full-year guidance" in prompt
     assert call["response_format"] == {"type": "json_object"}
+
+
+def test_questionnaire_turns_thinking_off_by_default_and_counts_tokens() -> None:
+    client = FakeClient(['{"overall": 1}'])
+    usage = SimpleNamespace(prompt_tokens=1200, prompt_cache_hit_tokens=900, completion_tokens=240,
+                            completion_tokens_details=SimpleNamespace(reasoning_tokens=0))
+    original = client._create
+    client.chat.completions.create = lambda **kw: SimpleNamespace(choices=original(**kw).choices, usage=usage)
+    before = dict(P.QUESTIONNAIRE_USAGE)
+    run_questionnaire("text", "AAA", AgentSettings(), client=client)
+    call = client.calls[0]
+    assert call["extra_body"] == {"thinking": {"type": "disabled"}} and call["max_tokens"] == P.QUESTIONNAIRE_MAX_TOKENS
+    assert "reasoning_effort" not in call
+    assert P.QUESTIONNAIRE_USAGE["calls"] == before["calls"] + 1
+    assert P.QUESTIONNAIRE_USAGE["prompt"] == before["prompt"] + 1200
+    assert P.QUESTIONNAIRE_USAGE["cache_hit"] == before["cache_hit"] + 900
+    assert P.QUESTIONNAIRE_USAGE["completion"] == before["completion"] + 240
+
+    client = FakeClient(['{"overall": 1}'])
+    run_questionnaire("text", "AAA", AgentSettings(questionnaire_thinking="low"), client=client)
+    call = client.calls[0]
+    assert call["extra_body"] == {"thinking": {"type": "enabled"}} and call["reasoning_effort"] == "low"
+    assert "max_tokens" not in call
+
+
+def test_thinking_level_parsing(monkeypatch) -> None:
+    assert [P._thinking_level(v) for v in (None, "OFF", "0", "on", "Low", "max")] == \
+        ["off", "off", "off", "high", "low", "max"]
+    with pytest.raises(ValueError):
+        P._thinking_level("sometimes")
+    monkeypatch.setenv("AGENT_Q_THINKING", "low")
+    assert AgentSettings.from_env().questionnaire_thinking == "low"
 
 
 def test_run_questionnaire_averages_samples_and_survives_one_failure() -> None:
@@ -402,6 +462,40 @@ def test_train_main_end_to_end_writes_a_loadable_combiner(tmp_path, monkeypatch)
     seen.clear()
     T.main([*args, "--fit-only"], questionnaire_fn=fake_questionnaire)
     assert seen == []
+
+
+def test_holdout_quarter_is_scored_but_never_trained_on(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(T, "CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setattr(T, "MODEL_PATH", tmp_path / "model" / "combiner.json")
+    monkeypatch.setattr(T, "BUNDLE_COPY", tmp_path / "bundle" / "combiner.json")
+    monkeypatch.setenv("AGENT_STORE_DIR", str(tmp_path / "store"))
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "")
+    monkeypatch.setenv("AGENT_ONLINE", "0")
+    monkeypatch.setenv("AGENT_USE_CALENDAR", "0")
+    files = []
+    for i, q in enumerate(("2026Q1", "2026Q2", "2026Q3")):
+        f = tmp_path / f"EARNINGS_RELEASE_{q}.jsonl.gz"
+        _archive_file(f, [(q, 90)], seed=i + 1)
+        files.append(f)
+    seen = []
+
+    def fake_questionnaire(materials, ticker, settings, company_name=None):
+        seen.append(materials)
+        guide = int(materials.split("GUIDE=")[1].split()[0])
+        return {k: None for k in QUESTION_KEYS} | {"guidance_change": float(guide), "overall": 0.0}
+
+    out = tmp_path / "model" / "combiner.json"
+    c = T.main(["--files", *map(str, files), "--offline", "--lambdas", "0.1,1", "--limit", "60",
+                "--holdout", "2026Q3", "--holdout-limit", "50", "--out", str(out)],
+               questionnaire_fn=fake_questionnaire)
+    assert len(seen) == 60 + 60 + 50
+    assert c.meta["quarters"] == ["2026Q1", "2026Q2"] and c.meta["n_rows"] == 120   # Q3 not trained on
+    assert c.meta["cv"]["folds"] == ["2026Q1", "2026Q2"]                             # nor tuned on
+    hold = c.meta["holdout"]
+    assert hold["quarter"] == "2026Q3" and hold["n"] == 50 and hold["delta_r2"] > 0
+    assert hold["ci90"][0] <= hold["delta_r2"] <= hold["ci90"][1]
+    assert json.loads(out.read_text())["meta"]["holdout"]["n"] == 50
+    assert "HOLDOUT 2026Q3" in capsys.readouterr().out
 
 
 # -- live pipeline ------------------------------------------------------------------

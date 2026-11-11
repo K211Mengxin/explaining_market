@@ -154,12 +154,15 @@ def _format_option_stats(stats: dict) -> str | None:
     return header + ":\n" + "\n".join(lines)
 
 
-def format_materials(bundle: object) -> str:
+def format_materials(bundle: object, preview_max_chars: int = PREVIEW_MAX_CHARS,
+                     include_options: bool = True) -> str:
     """Turn the event's bundle into the text the model reads.
 
     Each item gets its own labelled section. Items are found by `id`, so the
     order they arrive in does not matter, and an item this code has never heard
     of is included if it is text and skipped otherwise, never an error.
+    `preview_max_chars` / `include_options` let the questionnaire (section 12)
+    send a shorter text: it reads the option statistics as numbers, not prose.
     """
     if not isinstance(bundle, dict):
         return ""
@@ -176,7 +179,7 @@ def format_materials(bundle: object) -> str:
         )
 
     stats = (by_id.get(OPTION_STATS_ID) or {}).get("content")
-    if isinstance(stats, dict):
+    if include_options and isinstance(stats, dict):
         formatted = _format_option_stats(stats)
         if formatted:
             sections.append(formatted)
@@ -193,8 +196,8 @@ def format_materials(bundle: object) -> str:
 
     preview = (by_id.get(PREVIEW_ID) or {}).get("content")
     if isinstance(preview, str) and preview.strip():
-        text = preview[:PREVIEW_MAX_CHARS]
-        if len(preview) > PREVIEW_MAX_CHARS:
+        text = preview[:preview_max_chars]
+        if len(preview) > preview_max_chars:
             text += "\n[preview truncated]"
         sections.append(
             "Research note written BEFORE the release (expectations, not results):\n" + text
@@ -232,6 +235,12 @@ def format_materials(bundle: object) -> str:
 #   AGENT_COMBINER          path of combiner.json (default <store>/model/combiner.json)
 #   AGENT_Q_SAMPLES         questionnaire calls averaged per event (default 1); keep it
 #                           equal to the value used when training the combiner
+#   AGENT_Q_PREVIEW_CHARS   characters of the research note the questionnaire reads (default
+#                           8000, the same cut as the chain). Train and deploy with the same value.
+#   AGENT_Q_THINKING        off (default) / low / high / max: DeepSeek's thinking mode for the
+#                           questionnaire. DeepSeek thinks at "high" unless told otherwise, and
+#                           the reasoning is billed as output tokens: for a fill-in-the-form
+#                           task that is most of the bill. Train and deploy with the same value.
 # ============================================================================
 
 ALL_BLOCKS: tuple[str, ...] = (
@@ -282,6 +291,18 @@ def _flag(name: str, default: bool) -> bool:
     return default if raw is None else raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+THINKING_LEVELS = ("off", "low", "high", "max")
+
+
+def _thinking_level(value: str | None) -> str:
+    v = (value or "off").strip().lower()
+    v = {"0": "off", "false": "off", "no": "off", "none": "off", "disabled": "off",
+         "1": "high", "true": "high", "on": "high", "enabled": "high", "medium": "high"}.get(v, v)
+    if v not in THINKING_LEVELS:
+        raise ValueError(f"AGENT_Q_THINKING must be one of {THINKING_LEVELS}, got {value!r}")
+    return v
+
+
 @dataclass(frozen=True)
 class AgentSettings:
     deepseek_api_key: str | None = None
@@ -309,6 +330,8 @@ class AgentSettings:
     combiner_path: Path | None = None   # None -> <store_dir>/model/combiner.json
     questionnaire_samples: int = 1
     questionnaire_timeout_s: float = 60.0
+    questionnaire_thinking: str = "off"   # off / low / high / max
+    questionnaire_preview_chars: int = PREVIEW_MAX_CHARS
 
     @property
     def combiner_file(self) -> Path:
@@ -341,6 +364,8 @@ class AgentSettings:
             use_combiner=_flag("AGENT_USE_COMBINER", True),
             combiner_path=Path(env["AGENT_COMBINER"]) if env.get("AGENT_COMBINER") else None,
             questionnaire_samples=max(1, int(env.get("AGENT_Q_SAMPLES", "1"))),
+            questionnaire_thinking=_thinking_level(env.get("AGENT_Q_THINKING", "off")),
+            questionnaire_preview_chars=max(500, int(env.get("AGENT_Q_PREVIEW_CHARS", str(PREVIEW_MAX_CHARS)))),
         )
 
     def describe(self) -> str:
@@ -2210,7 +2235,20 @@ def _wait(futures, deadline: float, ctx: EventContext, label: str) -> None:
 # answers and a trained combiner are tied to it.
 # ============================================================================
 
-QUESTIONNAIRE_VERSION = "q2"
+QUESTIONNAIRE_VERSION = "q3"
+# The questionnaire reads the facts and the research note, but not the option
+# statistics, which the combiner uses as numbers. How much of the note it reads is
+# AGENT_Q_PREVIEW_CHARS: notes run ~8,000-12,000 characters, consensus estimates come
+# first, the scenario analysis (what counts as a beat or a miss) usually sits between
+# characters ~3,500 and ~8,000, so a short cut saves tokens but drops it.
+
+
+def questionnaire_materials(bundle: object, preview_chars: int = PREVIEW_MAX_CHARS) -> str:
+    """The event's materials as the questionnaire reads them."""
+    if bundle is None:
+        return ""
+    text = format_materials(bundle, preview_max_chars=preview_chars, include_options=False)
+    return text or json.dumps(bundle)[:preview_chars]
 
 
 @dataclass(frozen=True)
@@ -2289,13 +2327,19 @@ Respond with JSON only, with exactly the keys listed, e.g. {"eps_vs_expectation"
 """
 
 
-def questionnaire_prompt(materials: str) -> str:
+def _questionnaire_items() -> str:
     items = "\n".join(f'{i}. "{q.key}" (integer {q.lo} to {q.hi}, or null): {q.text}'
                       for i, q in enumerate(QUESTIONS, start=1))
     numbers = "\n".join(f'- "{k}" (number or null): {desc}' for k, desc in NUMBER_FIELDS)
     numbers += f'\n- "guidance_metric" (one of {", ".join(GUIDANCE_METRICS)}, or null): the metric of the guidance above'
-    return (f"Event materials:\n{materials}\n\nPart A, questionnaire:\n{items}\n\n"
-            f"Part B, numbers copied from the materials:\n{numbers}\n\nReturn the JSON object now.")
+    return f"Part A, questionnaire:\n{items}\n\nPart B, numbers copied from the materials:\n{numbers}"
+
+
+def questionnaire_prompt(materials: str) -> str:
+    """Fixed questionnaire FIRST, the event's materials LAST: every call then starts
+    with the same text, which DeepSeek's context cache bills at a lower rate."""
+    return (f"{_questionnaire_items()}\n\nThe event materials follow. Read them, then return the JSON "
+            f"object.\n\n=== EVENT MATERIALS ===\n{materials}\n=== END ===")
 
 
 _NAME_SUFFIX = re.compile(
@@ -2401,8 +2445,36 @@ def _questionnaire_client(settings: AgentSettings):
         return _Q_CLIENTS[key]
 
 
+QUESTIONNAIRE_MAX_TOKENS = 700   # the JSON answer is ~250 tokens; a cap bounds a runaway reply
+
+# Token counts of every questionnaire call in this process (train_combiner prints them).
+QUESTIONNAIRE_USAGE: dict[str, int] = {"calls": 0, "prompt": 0, "cache_hit": 0, "completion": 0, "reasoning": 0}
+_USAGE_LOCK = threading.Lock()
+
+
+def _record_usage(usage: object) -> None:
+    def num(obj: object, name: str) -> int:
+        v = getattr(obj, name, None)
+        return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+
+    details = getattr(usage, "prompt_tokens_details", None)
+    with _USAGE_LOCK:
+        QUESTIONNAIRE_USAGE["calls"] += 1
+        QUESTIONNAIRE_USAGE["prompt"] += num(usage, "prompt_tokens")
+        QUESTIONNAIRE_USAGE["cache_hit"] += num(usage, "prompt_cache_hit_tokens") or num(details, "cached_tokens")
+        QUESTIONNAIRE_USAGE["completion"] += num(usage, "completion_tokens")
+        QUESTIONNAIRE_USAGE["reasoning"] += num(getattr(usage, "completion_tokens_details", None), "reasoning_tokens")
+
+
+def _thinking_kwargs(level: str) -> dict:
+    """Request arguments for DeepSeek's thinking mode (on, at high effort, unless disabled)."""
+    if level == "off":
+        return {"extra_body": {"thinking": {"type": "disabled"}}, "max_tokens": QUESTIONNAIRE_MAX_TOKENS}
+    return {"extra_body": {"thinking": {"type": "enabled"}}, "reasoning_effort": level}
+
+
 def _ask_questionnaire(client, settings: AgentSettings, materials: str) -> dict[str, float | None]:
-    kwargs = {}
+    kwargs = _thinking_kwargs(settings.questionnaire_thinking)
     if settings.deepseek_temperature is not None:
         kwargs["temperature"] = settings.deepseek_temperature
     resp = client.chat.completions.create(
@@ -2412,6 +2484,7 @@ def _ask_questionnaire(client, settings: AgentSettings, materials: str) -> dict[
         response_format={"type": "json_object"},
         **kwargs,
     )
+    _record_usage(getattr(resp, "usage", None))
     return parse_questionnaire(resp.choices[0].message.content or "")
 
 
@@ -2841,8 +2914,9 @@ def _predict_with_combiner(event: dict, ticker: str, materials: str, bundle: obj
     pool = ThreadPoolExecutor(max_workers=1)
     t0 = time.monotonic()
     try:
-        q_future = pool.submit(run_questionnaire, materials, ticker, settings, company_name=name) \
-            if bundle is not None else None
+        q_future = pool.submit(run_questionnaire,
+                               questionnaire_materials(bundle, settings.questionnaire_preview_chars), ticker, settings,
+                               company_name=name) if bundle is not None else None
         try:
             context = build_context(event, ticker, settings, data)
         except Exception as exc:

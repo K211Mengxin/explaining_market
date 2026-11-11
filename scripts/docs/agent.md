@@ -37,7 +37,21 @@ per quarter**, which is exactly the quantity the scorer rewards (Frisch–Waugh�
 | 13 | combiner | `feature_row()` (shared with training) → standardise → weights → magnitude scaling → clip |
 | 14 | pipeline | `predict()`: materials → combiner (or chain) → 0.5 fallback |
 
-## The questionnaire (`QUESTIONNAIRE_VERSION = "q2"`)
+## The questionnaire (`QUESTIONNAIRE_VERSION = "q3"`)
+
+Thinking: DeepSeek's thinking mode is ON by default at high effort, and the reasoning is
+billed as output tokens. The questionnaire turns it off (`AGENT_Q_THINKING=off`, the
+default; `low` / `high` / `max` to compare). Train and deploy with the same value: the
+answer cache is kept per value, and `combiner.json` records it in `meta`. The training
+script prints the tokens per call (input, cached, output, reasoning) after extraction.
+
+Cost: the questionnaire does not read the option statistics (the combiner uses them as
+numbers), and its prompt puts the fixed questionnaire FIRST and the event's materials LAST,
+so every call starts with the same ~3,900 characters that DeepSeek's context cache can bill
+at its cheaper rate. `AGENT_Q_PREVIEW_CHARS` (default 8000) sets how much of the research
+note it reads; a shorter cut is cheaper but usually drops the note's scenario analysis.
+Answers are cached per (version, model, samples, thinking, preview length), and
+`--limit` samples are nested, so a run can be extended without paying twice.
 
 Part A, scored items:
 
@@ -86,8 +100,15 @@ are tied to it; a combiner trained on another version is ignored (falls back to 
   dropped. A missing value sits at the training mean (contributes 0).
 * Magnitude (`implied_move`, else `own_mean_abs_car`, `peer_mean_abs_car`, `vol_60d`, each
   converted to the base measure's scale by a median ratio) has no direction, so it is not a
-  linear feature. It stretches the prediction away from the centre by `sqrt(m / m_ref)`
-  (official option-statistics notebook), and only if that improved cross-validated ΔR².
+  linear feature. It stretches the prediction away from the centre by `(m / m_ref) ** p`
+  (the official option-statistics notebook uses p = 0.5).
+* Cross-validation chooses three things together: the ridge penalty λ, the exponent p
+  (0, 0.25, 0.5, 0.75, 1; 0 = no scaling) and how the weights meet the scaling —
+  **joint** (features multiplied by the same factor when training, so the weights are
+  the best ones given the scaling) or **after** (weights fitted unscaled, stretched
+  afterwards, the notebook's recipe). Joint fitting also gives high-magnitude events
+  more pull on the weights, which can help or hurt, so the data decides. The live
+  formula is the same either way: `0.5 + scale · g · z`, `g = (m / m_ref) ** p`.
 
 ## Commands
 
@@ -99,6 +120,10 @@ uv run --with akshare python scripts/build_store.py
 uv run python scripts/train_combiner.py --quarters 2026Q3 --limit 200
 uv run python scripts/train_combiner.py
 uv run python scripts/train_combiner.py --fit-only          # refit from the cache, no API calls
+# train and tune on three quarters, score once on a fourth that is never fitted or tuned on;
+# prints the combiner's dR2 with a bootstrap interval and the official baselines on the same rows
+uv run python scripts/train_combiner.py --quarters 2025Q4,2026Q1,2026Q2 --limit 200 \
+    --holdout 2026Q3 --holdout-limit 600
 uv run python scripts/train_combiner.py --no-questionnaire  # ablation: context numbers only
 # 3. upload the bundle (includes combiner.json)
 uv run modal volume put em-agent-store scripts/data/bundle /bundle --force
