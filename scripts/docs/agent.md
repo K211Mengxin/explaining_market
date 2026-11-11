@@ -37,7 +37,7 @@ per quarter**, which is exactly the quantity the scorer rewards (Frisch–Waugh�
 | 13 | combiner | `feature_row()` (shared with training) → standardise → weights → magnitude scaling → clip |
 | 14 | pipeline | `predict()`: materials → combiner (or chain) → 0.5 fallback |
 
-## The questionnaire (`QUESTIONNAIRE_VERSION = "q3"`)
+## The questionnaire (`QUESTIONNAIRE_VERSION = "q4"`, facts only)
 
 Thinking: DeepSeek's thinking mode is ON by default at high effort, and the reasoning is
 billed as output tokens. The questionnaire turns it off (`AGENT_Q_THINKING=off`, the
@@ -45,49 +45,53 @@ default; `low` / `high` / `max` to compare). Train and deploy with the same valu
 answer cache is kept per value, and `combiner.json` records it in `meta`. The training
 script prints the tokens per call (input, cached, output, reasoning) after extraction.
 
-Cost: the questionnaire does not read the option statistics (the combiner uses them as
-numbers), and its prompt puts the fixed questionnaire FIRST and the event's materials LAST,
-so every call starts with the same ~3,900 characters that DeepSeek's context cache can bill
-at its cheaper rate. `AGENT_Q_PREVIEW_CHARS` (default 8000) sets how much of the research
-note it reads; a shorter cut is cheaper but usually drops the note's scenario analysis.
-Answers are cached per (version, model, samples, thinking, preview length), and
-`--limit` samples are nested, so a run can be extended without paying twice.
+What it reads: ONLY the earnings-call facts. The research note (preview) exists only from
+2026Q3 on and the option statistics only in 2026Q3, so a model trained on earlier quarters
+must not read them live either, or training and live inputs differ; the option statistics
+reach the combiner as numbers anyway. A separate preview questionnaire (asking how results
+compare to the note's expectations) is the planned next step, trained on a quarter that has
+notes. The prompt puts the fixed questionnaire FIRST and the materials LAST, so every call
+shares one prefix for DeepSeek's context cache. Answers are cached per (version, model,
+samples, thinking), and `--limit` samples are nested, so a run can be extended without
+paying twice.
 
 Part A, scored items:
 
+Every item is answerable from the facts alone — the EPS surprise itself is NOT asked for in
+detail, because the scorer already controls for it and repeating it earns nothing:
+
 | Item | Scale | Asks |
 |---|---|---|
-| `eps_vs_expectation` | −2..2 | EPS vs the expectation stated in the materials |
-| `revenue_vs_expectation` | −2..2 | revenue vs expectation |
-| `guidance_change` | −2..2 | guidance raised / maintained / cut (null if none) |
-| `earnings_quality` | −1..1 | operating improvement vs one-offs (tax, asset sales, buybacks) |
+| `guidance_change` | −2..2 | guidance vs the company's OWN previous guidance (null only if none mentioned) |
+| `growth_trend` | −2..2 | revenue growth accelerating or decelerating vs the company's own recent quarters |
+| `earnings_quality` | −1..1 | operating improvement vs one-offs (tax, asset sales, milestones, buybacks) |
 | `margin_trend` | −1..1 | margins vs a year earlier |
 | `demand_outlook` | −2..2 | forward commentary on orders, backlog, pipeline |
-| `vs_preview` | −2..2 | results vs what the pre-release research note expected (null if no note) |
+| `vs_stated_expectation` | −2..2 | results vs an expectation the materials EXPLICITLY state (else null) |
 | `new_risks` | 0..3 | material new negatives |
-| `overall` | −5..5 | holistic view; kept as one more feature, so nothing is lost vs the old score |
+| `overall` | −5..5 | holistic read vs the company's own trajectory; MUST always be answered |
 
-Part B, numbers the model **copies** from the text (it never computes): `revenue_actual` /
-`revenue_expected`, `eps_actual` / `eps_expected` (same basis), `guidance_new_mid` /
-`guidance_ref_mid` (previous guidance, else consensus) and `guidance_metric`.
+Part B, numbers the model **copies** from the text (it never computes): `revenue_actual`,
+`revenue_yoy_pct` (this quarter's y/y growth as stated), `eps_actual`, `guidance_new_mid` /
+`guidance_ref_mid` (the company's previous guidance midpoint) and `guidance_metric`.
 
-### Surprises on each company's own scale
+### Changes on each company's own scale
 
-The same 2% revenue beat is large for a company whose growth barely varies and small for
-one whose growth swings by 10 points. So the code turns the copied pairs into surprises and
-divides them by the company's own variability:
+Growth speeding up by 2 points means more at a steady company than at one whose growth
+swings by 10. The code turns the copied numbers into changes and divides them by the
+company's own variability:
 
 | Feature | Definition |
 |---|---|
-| `revenue_surprise_pct` | revenue actual / expected − 1 |
-| `revenue_surprise_z` | ÷ `rev_growth_vol`: std of the company's y/y quarterly revenue growth over the last 8 quarters filed before the cutoff (floor 1 %, cap ±10) |
-| `guidance_change_pct` | new / reference guidance midpoint − 1 (revenue or unspecified metric) |
+| `growth_accel_pp` | copied y/y growth − the last filed quarter's y/y growth (SEC, point-in-time) |
+| `growth_accel_z` | ÷ `rev_growth_vol`: std of the company's y/y quarterly revenue growth over the last 8 quarters filed before the cutoff (floor 1 %, cap ±10) |
+| `guidance_change_pct` | new / previous guidance midpoint − 1 (revenue or unspecified metric) |
 | `guidance_change_z` | same company scale (revenue guidance only) |
-| `eps_surprise_px` | (EPS actual − expected) / last close: textbook price scaling, sane when expected EPS ≈ 0 |
 
-Guards: a relative change beyond ±50 % or an EPS surprise beyond 20 % of the price is treated
-as a units mix-up and dropped; with several samples (`AGENT_Q_SAMPLES`) numbers are combined
-by the median. Raw and scaled versions both go to the regression, which decides which helps.
+Guards: a guidance change beyond ±50 %, an acceleration beyond 75 points, or a copied
+"growth percent" beyond 400 is treated as a units mix-up and dropped; with several samples
+(`AGENT_Q_SAMPLES`) numbers are combined by the median. Raw and scaled versions both go to
+the regression, which decides which helps.
 
 Changing an item or the prompt: bump `QUESTIONNAIRE_VERSION`. Cached answers and combiners
 are tied to it; a combiner trained on another version is ignored (falls back to the chain).

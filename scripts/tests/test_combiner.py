@@ -32,15 +32,15 @@ from predict import (  # noqa: E402
 
 
 def test_parse_questionnaire_clips_and_keeps_nulls() -> None:
-    reply = '```json\n{"eps_vs_expectation": 7, "guidance_change": null, "overall": "-2", "margin_trend": true}\n```'
+    reply = '```json\n{"growth_trend": 7, "guidance_change": null, "overall": "-2", "margin_trend": true}\n```'
     out = parse_questionnaire(reply)
     assert set(out) == set(QUESTION_KEYS) | set(P.NUMBER_KEYS) | {"guidance_metric"}
     assert all(out[k] is None for k in P.NUMBER_KEYS) and out["guidance_metric"] is None
-    assert out["eps_vs_expectation"] == 2.0          # clipped to the item's scale
+    assert out["growth_trend"] == 2.0                # clipped to the item's scale
     assert out["overall"] == -2.0                    # numeric string accepted
     assert out["guidance_change"] is None
     assert out["margin_trend"] is None               # booleans are not answers
-    assert out["revenue_vs_expectation"] is None     # missing key -> null
+    assert out["demand_outlook"] is None             # missing key -> null
 
 
 @pytest.mark.parametrize("reply", ["not json", "[1, 2]", '{"unrelated": 1}', '{"overall": null}'])
@@ -50,9 +50,9 @@ def test_parse_questionnaire_rejects_unusable_replies(reply) -> None:
 
 
 def test_parse_questionnaire_reads_the_copied_numbers() -> None:
-    out = parse_questionnaire('{"overall": 1, "revenue_actual": 5.1, "revenue_expected": "4.9", '
+    out = parse_questionnaire('{"overall": 1, "revenue_actual": 5.1, "revenue_yoy_pct": "16", '
                               '"eps_actual": null, "guidance_metric": "Revenue", "guidance_new_mid": 1e20}')
-    assert out["revenue_actual"] == 5.1 and out["revenue_expected"] == 4.9
+    assert out["revenue_actual"] == 5.1 and out["revenue_yoy_pct"] == 16.0
     assert out["eps_actual"] is None and out["guidance_new_mid"] is None   # absurd number dropped
     assert out["guidance_metric"] == "revenue"
     assert parse_questionnaire('{"overall": 1, "guidance_metric": "margin"}')["guidance_metric"] is None
@@ -64,18 +64,17 @@ def test_prompt_asks_for_numbers_without_computing() -> None:
     assert "Do not compute" in P.QUESTIONNAIRE_SYSTEM
 
 
-def test_questionnaire_reads_a_shorter_text_with_the_fixed_part_first() -> None:
+def test_questionnaire_reads_facts_only_with_the_fixed_part_first() -> None:
     bundle = {"items": [
         {"id": "earnings-call-facts", "kind": "facts", "content": ["Revenue up 12%."]},
         {"id": "option-implied-stats", "kind": "stats", "content": {
             "implied_earnings_volatility": {"value": 0.07, "status": "ok"}}},
         {"id": "earnings-preview", "kind": "preview", "content": "P" * 9000},
     ]}
-    full, short = P.format_materials(bundle), P.questionnaire_materials(bundle, 3000)
+    full, short = P.format_materials(bundle), P.questionnaire_materials(bundle)
     assert "Implied earnings volatility" in full and "Implied earnings volatility" not in short
-    assert "P" * 3000 in short and "P" * 3001 not in short
-    assert "P" * 8000 in P.questionnaire_materials(bundle)             # default: the chain's cut
-    assert "Revenue up 12%." in short and len(short) < len(full) / 2
+    assert "P" * 50 in full and "P" * 50 not in short and "Research note" not in short
+    assert "Revenue up 12%." in short                                  # the facts are all it reads
     assert P.questionnaire_materials(None) == ""
     # every prompt starts with the same text (cache-friendly); materials come last
     a, b = P.questionnaire_prompt("event A"), P.questionnaire_prompt("event B")
@@ -210,31 +209,35 @@ def test_option_stats_and_feature_row() -> None:
     assert mags == {"implied_move": 0.06, "own_mean_abs_car": 0.04, "peer_mean_abs_car": None, "vol_60d": 0.3}
 
 
-def test_same_revenue_beat_scores_higher_for_the_steadier_company() -> None:
-    answers = {"revenue_actual": 102.0, "revenue_expected": 100.0}           # a 2% beat for both
-    steady = P.surprise_features(answers, {"rev_growth_vol": 0.01})
-    volatile = P.surprise_features(answers, {"rev_growth_vol": 0.10})
-    assert steady["revenue_surprise_pct"] == volatile["revenue_surprise_pct"] == pytest.approx(0.02)
-    assert steady["revenue_surprise_z"] == pytest.approx(2.0)                # 2 standard deviations
-    assert volatile["revenue_surprise_z"] == pytest.approx(0.2)
+def test_same_acceleration_counts_more_at_the_steadier_company() -> None:
+    answers = {"revenue_yoy_pct": 14.0}                  # growth sped up from 12% to 14% for both
+    steady = P.derived_features(answers, {"rev_yoy": 0.12, "rev_growth_vol": 0.01})
+    volatile = P.derived_features(answers, {"rev_yoy": 0.12, "rev_growth_vol": 0.10})
+    assert steady["growth_accel_pp"] == volatile["growth_accel_pp"] == pytest.approx(0.02)
+    assert steady["growth_accel_z"] == pytest.approx(2.0)               # 2 standard deviations
+    assert volatile["growth_accel_z"] == pytest.approx(0.2)
     # a tiny company scale is floored, and z is capped
-    assert P.surprise_features(answers, {"rev_growth_vol": 0.0001})["revenue_surprise_z"] == pytest.approx(2.0)
-    assert P.surprise_features({"revenue_actual": 140.0, "revenue_expected": 100.0},
-                               {"rev_growth_vol": 0.01})["revenue_surprise_z"] == 10.0
+    assert P.derived_features(answers, {"rev_yoy": 0.12, "rev_growth_vol": 0.0001})["growth_accel_z"] == \
+        pytest.approx(2.0)
+    assert P.derived_features({"revenue_yoy_pct": 60.0},
+                              {"rev_yoy": 0.10, "rev_growth_vol": 0.01})["growth_accel_z"] == 10.0
 
 
-def test_surprise_features_guard_against_units_and_metric_mixups() -> None:
-    out = P.surprise_features({"revenue_actual": 5100.0, "revenue_expected": 4.9,        # millions vs billions
-                               "guidance_new_mid": 1.10, "guidance_ref_mid": 1.00, "guidance_metric": "eps",
-                               "eps_actual": 1.32, "eps_expected": 1.20}, {"last_close": 60.0, "rev_growth_vol": 0.05})
-    assert out["revenue_surprise_pct"] is None and out["revenue_surprise_z"] is None
+def test_derived_features_guard_against_units_and_metric_mixups() -> None:
+    # revenue copied into the growth field (89300 "percent") and EPS guidance: both rejected
+    out = P.derived_features({"revenue_yoy_pct": 89300.0, "guidance_new_mid": 1.10,
+                              "guidance_ref_mid": 1.00, "guidance_metric": "eps"},
+                             {"rev_yoy": 0.10, "rev_growth_vol": 0.05})
+    assert out["growth_accel_pp"] is None and out["growth_accel_z"] is None
     assert out["guidance_change_pct"] is None                                # EPS guidance is not revenue
-    assert out["eps_surprise_px"] == pytest.approx(0.12 / 60)
-    rev_guide = P.surprise_features({"guidance_new_mid": 20.2, "guidance_ref_mid": 19.5, "guidance_metric": "revenue"},
-                                    {"rev_growth_vol": 0.05})
+    # an acceleration of 88 points in one quarter is a mix-up too
+    assert P.derived_features({"revenue_yoy_pct": 100.0}, {"rev_yoy": 0.12, "rev_growth_vol": 0.05})[
+        "growth_accel_pp"] is None
+    rev_guide = P.derived_features({"guidance_new_mid": 20.2, "guidance_ref_mid": 19.5,
+                                    "guidance_metric": "revenue"}, {"rev_growth_vol": 0.05})
     assert rev_guide["guidance_change_pct"] == pytest.approx(0.7 / 19.5)
     assert rev_guide["guidance_change_z"] == pytest.approx(0.7 / 19.5 / 0.05)
-    assert P.surprise_features(None, None) == {k: None for k in P.SURPRISE_FEATURES}
+    assert P.derived_features(None, None) == {k: None for k in P.DERIVED_FEATURES}
 
 
 def test_revenue_growth_volatility_from_quarterly_filings() -> None:
@@ -347,7 +350,7 @@ def test_training_recovers_the_signal_beyond_the_surprise() -> None:
     rows = synthetic_rows()
     names, coverage = T.choose_features(rows, 0.05)
     assert "q_guidance_change" in names and "has_options" not in names  # constant -> dropped
-    assert "q_eps_vs_expectation" not in names                         # never answered -> dropped
+    assert "q_vs_stated_expectation" not in names                      # never answered -> dropped
     cv = T.cross_validate(rows, names, [0.01, 1.0, 100.0], seed=0)
     assert cv["folds"] == ["2026Q1", "2026Q2", "2026Q3"]                # leave one quarter out
     no_scaling = cv["table"][T._cv_label(cv["lambda"], 0.0, True)]["mean"]

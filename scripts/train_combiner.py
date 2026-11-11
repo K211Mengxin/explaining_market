@@ -217,8 +217,7 @@ def _slug(text: str) -> str:
 
 def questionnaire_cache(settings: AgentSettings) -> JsonlCache:
     name = (f"questionnaire_{QUESTIONNAIRE_VERSION}_{_slug(settings.deepseek_model)}"
-            f"_n{settings.questionnaire_samples}_think-{settings.questionnaire_thinking}"
-            f"_prev{settings.questionnaire_preview_chars}.jsonl")
+            f"_n{settings.questionnaire_samples}_think-{settings.questionnaire_thinking}.jsonl")
     return JsonlCache(CACHE_DIR / name)
 
 
@@ -258,7 +257,7 @@ def extract_one(row: dict, settings: AgentSettings, qcache: JsonlCache | None, c
     if qcache is not None:
         q = qcache.get(key)
         if q is None and ask:
-            materials = P.questionnaire_materials(rec["disclosure"], settings.questionnaire_preview_chars)
+            materials = P.questionnaire_materials(rec["disclosure"])
             name = (P.get_data(settings).sec.profiles().get(ticker.upper()) or {}).get("name")
             fn = questionnaire_fn or P.run_questionnaire
             try:
@@ -594,8 +593,7 @@ def main(argv: list[str] | None = None, *, questionnaire_fn=None) -> Combiner | 
     # 3. extract
     print(f"extracting features for {len(rows)} outcomes "
           f"(questionnaire {QUESTIONNAIRE_VERSION if use_q else 'off'}, model {settings.deepseek_model}, "
-          f"samples {settings.questionnaire_samples}, thinking {settings.questionnaire_thinking}, "
-          f"preview {settings.questionnaire_preview_chars} chars) ...")
+          f"samples {settings.questionnaire_samples}, thinking {settings.questionnaire_thinking}) ...")
     data = extract_all(rows, settings, workers=args.workers, ask=not args.fit_only, use_questionnaire=use_q,
                        refresh_context=args.refresh_context, questionnaire_fn=questionnaire_fn)
     failed = sum(1 for r in data if use_q and r["features"].get("q_overall") is None)
@@ -633,7 +631,6 @@ def main(argv: list[str] | None = None, *, questionnaire_fn=None) -> Combiner | 
             "quarters": sorted({r["quarter"] for r in data}), "n_rows": len(data),
             "model": settings.deepseek_model, "questionnaire_samples": settings.questionnaire_samples,
             "questionnaire_thinking": settings.questionnaire_thinking,
-            "questionnaire_preview_chars": settings.questionnaire_preview_chars,
             "lambda": cv["lambda"], "cv": cv, "coverage": {n: round(coverage[n], 3) for n in names},
             "dropped": sorted(set(FEATURE_NAMES) - set(names))}
     meta["magnitude_power"], meta["magnitude_joint"] = cv["power"], cv["joint"]

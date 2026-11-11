@@ -155,14 +155,15 @@ def _format_option_stats(stats: dict) -> str | None:
 
 
 def format_materials(bundle: object, preview_max_chars: int = PREVIEW_MAX_CHARS,
-                     include_options: bool = True) -> str:
+                     include_options: bool = True, include_preview: bool = True) -> str:
     """Turn the event's bundle into the text the model reads.
 
     Each item gets its own labelled section. Items are found by `id`, so the
     order they arrive in does not matter, and an item this code has never heard
     of is included if it is text and skipped otherwise, never an error.
-    `preview_max_chars` / `include_options` let the questionnaire (section 12)
-    send a shorter text: it reads the option statistics as numbers, not prose.
+    `include_preview` / `include_options` let the questionnaire (section 12) read
+    the facts alone: it uses the option statistics as numbers, and the research
+    note only exists from 2026Q3 on, so training on it would split the data.
     """
     if not isinstance(bundle, dict):
         return ""
@@ -195,7 +196,7 @@ def format_materials(bundle: object, preview_max_chars: int = PREVIEW_MAX_CHARS,
             sections.append(f"Additional material ({label}):\n{content[:OTHER_ITEM_MAX_CHARS]}")
 
     preview = (by_id.get(PREVIEW_ID) or {}).get("content")
-    if isinstance(preview, str) and preview.strip():
+    if include_preview and isinstance(preview, str) and preview.strip():
         text = preview[:preview_max_chars]
         if len(preview) > preview_max_chars:
             text += "\n[preview truncated]"
@@ -235,8 +236,6 @@ def format_materials(bundle: object, preview_max_chars: int = PREVIEW_MAX_CHARS,
 #   AGENT_COMBINER          path of combiner.json (default <store>/model/combiner.json)
 #   AGENT_Q_SAMPLES         questionnaire calls averaged per event (default 1); keep it
 #                           equal to the value used when training the combiner
-#   AGENT_Q_PREVIEW_CHARS   characters of the research note the questionnaire reads (default
-#                           8000, the same cut as the chain). Train and deploy with the same value.
 #   AGENT_Q_THINKING        off (default) / low / high / max: DeepSeek's thinking mode for the
 #                           questionnaire. DeepSeek thinks at "high" unless told otherwise, and
 #                           the reasoning is billed as output tokens: for a fill-in-the-form
@@ -331,7 +330,6 @@ class AgentSettings:
     questionnaire_samples: int = 1
     questionnaire_timeout_s: float = 60.0
     questionnaire_thinking: str = "off"   # off / low / high / max
-    questionnaire_preview_chars: int = PREVIEW_MAX_CHARS
 
     @property
     def combiner_file(self) -> Path:
@@ -365,7 +363,6 @@ class AgentSettings:
             combiner_path=Path(env["AGENT_COMBINER"]) if env.get("AGENT_COMBINER") else None,
             questionnaire_samples=max(1, int(env.get("AGENT_Q_SAMPLES", "1"))),
             questionnaire_thinking=_thinking_level(env.get("AGENT_Q_THINKING", "off")),
-            questionnaire_preview_chars=max(500, int(env.get("AGENT_Q_PREVIEW_CHARS", str(PREVIEW_MAX_CHARS)))),
         )
 
     def describe(self) -> str:
@@ -2225,30 +2222,31 @@ def _wait(futures, deadline: float, ctx: EventContext, label: str) -> None:
 # the stock actually reacted. Recall would inflate a backtest and would not carry
 # over to live events.
 #
-# Besides the scored items, the model COPIES a few numbers from the text (actual
-# vs expected revenue and EPS, new vs reference guidance). It never computes
-# anything: section 13 turns the pairs into surprises and puts them on each
-# company's own scale (a 2% revenue beat means more for a steady company than for
-# one whose growth swings by 10 points).
+# Besides the scored items, the model COPIES a few numbers from the text (this
+# quarter's revenue growth, the new and the previous guidance midpoints). It never
+# computes anything: section 13 turns them into changes on each company's own scale
+# (growth speeding up by 2 points means more at a steady company than at one whose
+# growth swings by 10).
 #
 # Bump QUESTIONNAIRE_VERSION whenever an item or the prompt changes: cached
 # answers and a trained combiner are tied to it.
 # ============================================================================
 
-QUESTIONNAIRE_VERSION = "q3"
-# The questionnaire reads the facts and the research note, but not the option
-# statistics, which the combiner uses as numbers. How much of the note it reads is
-# AGENT_Q_PREVIEW_CHARS: notes run ~8,000-12,000 characters, consensus estimates come
-# first, the scenario analysis (what counts as a beat or a miss) usually sits between
-# characters ~3,500 and ~8,000, so a short cut saves tokens but drops it.
+QUESTIONNAIRE_VERSION = "q4"
+# The questionnaire reads ONLY the earnings-call facts (and any extra text items):
+# no research note, no option statistics. The note exists only from 2026Q3 on, so a
+# model trained on quarters without it must not read it live either, or training and
+# live inputs differ; the option statistics reach the combiner as numbers. A second,
+# preview-only questionnaire is the planned next step once a quarter with notes can
+# be spared for training.
 
 
-def questionnaire_materials(bundle: object, preview_chars: int = PREVIEW_MAX_CHARS) -> str:
-    """The event's materials as the questionnaire reads them."""
+def questionnaire_materials(bundle: object) -> str:
+    """The event's materials as the questionnaire reads them: the facts alone."""
     if bundle is None:
         return ""
-    text = format_materials(bundle, preview_max_chars=preview_chars, include_options=False)
-    return text or json.dumps(bundle)[:preview_chars]
+    text = format_materials(bundle, include_options=False, include_preview=False)
+    return text or json.dumps(bundle)[:PREVIEW_MAX_CHARS]
 
 
 @dataclass(frozen=True)
@@ -2260,36 +2258,37 @@ class Question:
 
 
 QUESTIONS: tuple[Question, ...] = (
-    Question("eps_vs_expectation", -2, 2,
-             "EPS versus the expectation stated in the materials (consensus, prior guidance or the "
-             "research note): +2 clearly above, +1 slightly above, 0 in line, -1 slightly below, "
-             "-2 clearly below."),
-    Question("revenue_vs_expectation", -2, 2,
-             "Revenue versus the expectation stated in the materials, same scale as above."),
     Question("guidance_change", -2, 2,
-             "Forward guidance versus the company's previous guidance or the stated expectation: "
-             "+2 clearly raised, +1 slightly raised, 0 maintained, -1 slightly lowered, "
-             "-2 clearly cut or withdrawn. null if no guidance is mentioned."),
+             "Forward guidance versus the company's OWN previous guidance or trajectory, as stated: "
+             "+2 clearly raised, +1 slightly raised, 0 maintained or first given in line with the "
+             "quarter, -1 slightly lowered, -2 clearly cut or withdrawn. null ONLY if the materials "
+             "mention no guidance or outlook at all."),
+    Question("growth_trend", -2, 2,
+             "Revenue growth this quarter versus the company's own recent quarters or year-ago "
+             "period, as stated: +2 clearly accelerating, +1 somewhat faster, 0 steady, "
+             "-1 somewhat slower, -2 clearly decelerating or shrinking."),
     Question("earnings_quality", -1, 1,
-             "Where the EPS result comes from: +1 operating improvement (revenue growth, margins), "
-             "0 mixed or unclear, -1 mainly one-offs (lower tax rate, asset sales, reserve releases, "
-             "share buybacks)."),
+             "Where the profit result comes from: +1 operating improvement (revenue growth, margins, "
+             "volumes), 0 mixed or unclear, -1 mainly one-offs (lower tax rate, asset sales, reserve "
+             "releases, milestone payments, share buybacks)."),
     Question("margin_trend", -1, 1,
              "Gross or operating margin versus a year earlier: +1 expanding, 0 flat, -1 contracting."),
     Question("demand_outlook", -2, 2,
              "Management's forward-looking statements about demand (orders, bookings, backlog, "
              "pipeline, customer spending): +2 clearly strengthening, +1 somewhat stronger, 0 stable, "
              "-1 somewhat weaker, -2 clearly weakening."),
-    Question("vs_preview", -2, 2,
-             "Against the research note written BEFORE the release (its expectations and the key "
-             "debates it names): +2 results clearly better than the note expected, 0 roughly as "
-             "expected, -2 clearly worse. null if there is no research note."),
+    Question("vs_stated_expectation", -2, 2,
+             "ONLY when the materials explicitly state an outside expectation (consensus, analyst "
+             "estimate): results versus it, +2 clearly above to -2 clearly below. null when no such "
+             "expectation is stated; never judge against your own sense of expectations."),
     Question("new_risks", 0, 3,
              "Material new negatives the materials reveal (regulatory, legal, supply chain, customer "
              "loss, management departure, accounting issues): 0 none, 1 minor, 2 notable, 3 severe."),
     Question("overall", -5, 5,
-             "Overall, how much better or worse than what the market expected was this release: "
-             "+5 far better, 0 as expected, -5 far worse."),
+             "Your overall read of the release for the company's prospects, judged against the "
+             "trajectory the materials themselves imply: +5 excellent (broad strength and a raised "
+             "outlook), 0 unremarkable, -5 terrible. ALWAYS answer this item with an integer, "
+             "never null."),
 )
 QUESTION_KEYS: tuple[str, ...] = tuple(q.key for q in QUESTIONS)
 
@@ -2297,15 +2296,13 @@ QUESTION_KEYS: tuple[str, ...] = tuple(q.key for q in QUESTIONS)
 # WITHIN a pair; section 13 uses ratios.
 NUMBER_FIELDS: tuple[tuple[str, str], ...] = (
     ("revenue_actual", "reported revenue for the quarter"),
-    ("revenue_expected", "the expectation for that revenue stated in the materials (consensus, else the "
-                         "midpoint of the company's prior guidance), in the same units as revenue_actual"),
-    ("eps_actual", "reported EPS for the quarter"),
-    ("eps_expected", "the expectation for that EPS stated in the materials, on the SAME basis "
-                     "(adjusted vs GAAP) as eps_actual"),
+    ("revenue_yoy_pct", "this quarter's year-over-year revenue growth in percent, as stated "
+                        "(16 for 16% growth, -5 for a 5% decline)"),
+    ("eps_actual", "reported EPS for the quarter (adjusted if both are given)"),
     ("guidance_new_mid", "midpoint of the newly issued guidance for the main guided metric "
                          "(prefer revenue; a single number counts as its own midpoint)"),
-    ("guidance_ref_mid", "the reference for that same metric and period: the company's previous guidance "
-                         "midpoint, else the consensus stated in the materials; same units"),
+    ("guidance_ref_mid", "the company's PREVIOUS guidance midpoint for that same metric and period, "
+                         "as stated in the materials; same units as guidance_new_mid"),
 )
 NUMBER_KEYS: tuple[str, ...] = tuple(k for k, _ in NUMBER_FIELDS)
 GUIDANCE_METRICS = ("revenue", "eps", "other")
@@ -2313,17 +2310,19 @@ GUIDANCE_METRICS = ("revenue", "eps", "other")
 QUESTIONNAIRE_SYSTEM = """\
 You are an equity analyst filling in a fixed questionnaire about one company's earnings release.
 
+The materials are factual bullet points from one earnings release. There is usually no
+outside consensus in them: judge each item against the company's OWN stated trajectory
+(its previous guidance, its recent growth, the year-ago figures it cites).
+
 Rules:
 - Part A: answer every item strictly on its own scale, as an integer.
-- Judge results RELATIVE TO EXPECTATIONS stated in the materials (consensus, prior guidance,
-  the research note), not in absolute terms. When deciding between "clearly" and "slightly",
-  judge against what is normal for THIS company if the materials indicate it.
-- Part B: copy numbers exactly as stated in the materials. Do not compute, convert or
-  estimate. Both numbers of a pair must use the same units and basis.
-- Use null when the materials do not address an item or state a number. Do not guess.
+- "overall" must ALWAYS be an integer, never null: it is your holistic read of the release.
+- For the other items, use null only when the materials say nothing about that item.
+- Part B: copy numbers exactly as stated. Do not compute, convert or estimate.
+  guidance_new_mid and guidance_ref_mid must use the same units.
 - The company is referred to as "the company"; do not try to identify it.
 
-Respond with JSON only, with exactly the keys listed, e.g. {"eps_vs_expectation": 1, ...}.
+Respond with JSON only, with exactly the keys listed, e.g. {"guidance_change": 1, ...}.
 """
 
 
@@ -2537,14 +2536,15 @@ CONTEXT_FEATURES: tuple[str, ...] = (
     "rev_yoy", "op_margin", "accruals", "earnings_yield", "log_market_cap",
     "skew_25d", "has_options",
 )
-# Surprises computed from the numbers the model copied, raw and on the company's own scale.
-SURPRISE_FEATURES: tuple[str, ...] = (
-    "revenue_surprise_pct", "revenue_surprise_z", "guidance_change_pct", "guidance_change_z", "eps_surprise_px",
+# Changes computed from the numbers the model copied, raw and on the company's own scale.
+DERIVED_FEATURES: tuple[str, ...] = (
+    "growth_accel_pp", "growth_accel_z", "guidance_change_pct", "guidance_change_z",
 )
-FEATURE_NAMES: tuple[str, ...] = tuple(f"q_{k}" for k in QUESTION_KEYS) + SURPRISE_FEATURES + CONTEXT_FEATURES
+FEATURE_NAMES: tuple[str, ...] = tuple(f"q_{k}" for k in QUESTION_KEYS) + DERIVED_FEATURES + CONTEXT_FEATURES
 
-MAX_REL_CHANGE = 0.5      # |actual / expected - 1| beyond this is almost surely a units mix-up
-MAX_PRICE_SURPRISE = 0.2  # |EPS surprise| beyond 20% of the share price: same
+MAX_REL_CHANGE = 0.5      # |new / previous - 1| beyond this is almost surely a units mix-up
+MAX_GROWTH_ACCEL = 0.75   # |growth acceleration| beyond 75 points: same (revenue copied as growth)
+MAX_YOY_PCT = 400         # a copied "growth percent" beyond this is not a percent
 MIN_GROWTH_VOL = 0.01     # floor of the company scale, so a very steady company cannot explode z
 MAX_Z = 10.0
 # Unsigned size-of-reaction measures, in order of preference.
@@ -2576,19 +2576,23 @@ def _rel_change(new: float | None, ref: float | None) -> float | None:
     return r if abs(r) <= MAX_REL_CHANGE else None
 
 
-def surprise_features(answers: dict | None, ctx_data: dict | None) -> dict[str, float | None]:
-    """Surprises from the copied numbers, raw and scaled by the company's own variability.
+def derived_features(answers: dict | None, ctx_data: dict | None) -> dict[str, float | None]:
+    """Changes computed from the copied numbers, raw and on the company's own scale.
 
-    revenue_surprise_pct   revenue actual / expected - 1
-    revenue_surprise_z     ... divided by the std of the company's y/y revenue growth
-                           (fundamentals.rev_growth_vol): "how unusual for THIS company"
-    guidance_change_pct    new / reference guidance midpoint - 1 (revenue or unspecified metric)
-    guidance_change_z      ... on the same company scale (revenue guidance only)
-    eps_surprise_px        (EPS actual - expected) / last close, the textbook price scaling,
-                           which stays sane when expected EPS is near zero
+    growth_accel_pp     this quarter's y/y revenue growth (copied from the text) minus the
+                        last FILED quarter's (SEC, point-in-time): growth speeding up or slowing
+    growth_accel_z      ... divided by the std of the company's own y/y growth
+                        (fundamentals.rev_growth_vol): "how unusual for THIS company"
+    guidance_change_pct new / previous guidance midpoint - 1 (revenue or unspecified metric)
+    guidance_change_z   ... on the same company scale (revenue guidance only)
     """
     a, d = answers or {}, ctx_data or {}
-    rev = _rel_change(_finite(a.get("revenue_actual")), _finite(a.get("revenue_expected")))
+    yoy_pct = _finite(a.get("revenue_yoy_pct"))
+    yoy = yoy_pct / 100 if yoy_pct is not None and abs(yoy_pct) <= MAX_YOY_PCT else None
+    prior = _finite(d.get("rev_yoy"))
+    accel = yoy - prior if yoy is not None and prior is not None else None
+    if accel is not None and abs(accel) > MAX_GROWTH_ACCEL:
+        accel = None
     metric = a.get("guidance_metric")
     guide = _rel_change(_finite(a.get("guidance_new_mid")), _finite(a.get("guidance_ref_mid"))) \
         if metric in ("revenue", None) else None
@@ -2598,13 +2602,8 @@ def surprise_features(answers: dict | None, ctx_data: dict | None) -> dict[str, 
     def z(x: float | None) -> float | None:
         return None if x is None or scale is None else max(-MAX_Z, min(MAX_Z, x / scale))
 
-    eps_a, eps_e, px = _finite(a.get("eps_actual")), _finite(a.get("eps_expected")), _finite(d.get("last_close"))
-    eps_px = None
-    if eps_a is not None and eps_e is not None and px and px > 0:
-        eps_px = (eps_a - eps_e) / px
-        eps_px = eps_px if abs(eps_px) <= MAX_PRICE_SURPRISE else None
-    return {"revenue_surprise_pct": rev, "revenue_surprise_z": z(rev), "guidance_change_pct": guide,
-            "guidance_change_z": z(guide) if metric == "revenue" else None, "eps_surprise_px": eps_px}
+    return {"growth_accel_pp": accel, "growth_accel_z": z(accel), "guidance_change_pct": guide,
+            "guidance_change_z": z(guide) if metric == "revenue" else None}
 
 
 def feature_row(answers: dict | None, ctx_data: dict | None, options: dict | None) -> dict[str, float | None]:
@@ -2612,7 +2611,7 @@ def feature_row(answers: dict | None, ctx_data: dict | None, options: dict | Non
     training script and the live pipeline cannot drift apart."""
     answers, d, options = answers or {}, ctx_data or {}, options or {}
     row: dict[str, float | None] = {f"q_{k}": _finite(answers.get(k)) for k in QUESTION_KEYS}
-    row.update(surprise_features(answers, d))
+    row.update(derived_features(answers, d))
     for key in ("abn_ret_5d", "abn_ret_20d", "abn_ret_60d", "pos_52w", "peer_mean_car", "sector_mean_car",
                 "rev_yoy", "op_margin", "accruals", "earnings_yield"):
         row[key] = _finite(d.get(key))
@@ -2914,8 +2913,7 @@ def _predict_with_combiner(event: dict, ticker: str, materials: str, bundle: obj
     pool = ThreadPoolExecutor(max_workers=1)
     t0 = time.monotonic()
     try:
-        q_future = pool.submit(run_questionnaire,
-                               questionnaire_materials(bundle, settings.questionnaire_preview_chars), ticker, settings,
+        q_future = pool.submit(run_questionnaire, questionnaire_materials(bundle), ticker, settings,
                                company_name=name) if bundle is not None else None
         try:
             context = build_context(event, ticker, settings, data)
