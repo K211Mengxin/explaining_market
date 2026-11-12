@@ -48,9 +48,14 @@ script prints the tokens per call (input, cached, output, reasoning) after extra
 What it reads: ONLY the earnings-call facts. The research note (preview) exists only from
 2026Q3 on and the option statistics only in 2026Q3, so a model trained on earlier quarters
 must not read them live either, or training and live inputs differ; the option statistics
-reach the combiner as numbers anyway. A separate preview questionnaire (asking how results
-compare to the note's expectations) is the planned next step, trained on a quarter that has
-notes. The prompt puts the fixed questionnaire FIRST and the materials LAST, so every call
+reach the combiner as numbers anyway. A SECOND questionnaire (`p1`, "model B") runs only for
+events that carry a note: it reads the note AND the facts and grades the release against
+the note's own expectations (revenue / guidance / the note's key metrics vs the note, which
+scenario hit, what the note missed, a mandatory `overall_vs_note`), and copies the note's
+consensus numbers, which pair with q4's actuals into revenue and EPS surprises on the
+company's own scale. Its features are simply missing on events without a note (plus a
+`has_preview` flag), so one combiner serves both; `combiner.json` records the preview
+version and is rejected on a mismatch. The prompt puts the fixed questionnaire FIRST and the materials LAST, so every call
 shares one prefix for DeepSeek's context cache. Answers are cached per (version, model,
 samples, thinking), and `--limit` samples are nested, so a run can be extended without
 paying twice.
@@ -128,6 +133,11 @@ uv run python scripts/train_combiner.py --fit-only          # refit from the cac
 # prints the combiner's dR2 with a bootstrap interval and the official baselines on the same rows
 uv run python scripts/train_combiner.py --quarters 2025Q4,2026Q1,2026Q2 --limit 200 \
     --holdout 2026Q3 --holdout-limit 600
+# model B: Q3's research notes train the preview features; Q4 (unsealed, so provisional) tests.
+# --cv random: quarter folds can never train AND test on the one quarter that has notes.
+# Add --no-preview for model A on the same rows (the note's increment = the difference).
+uv run python scripts/train_combiner.py --quarters 2025Q4,2026Q1,2026Q2,2026Q3 --limit 600 \
+    --holdout 2026Q4 --holdout-limit 600 --cv random
 uv run python scripts/train_combiner.py --no-questionnaire  # ablation: context numbers only
 # 3. upload the bundle (includes combiner.json)
 uv run modal volume put em-agent-store scripts/data/bundle /bundle --force

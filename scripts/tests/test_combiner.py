@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import predict as P  # noqa: E402
 import train_combiner as T  # noqa: E402
 from predict import (  # noqa: E402
+    PREVIEW_QUESTION_KEYS, PREVIEW_NUMBER_KEYS,
     QUESTION_KEYS, AgentSettings, Combiner, anonymize, average_answers, company_core_name, feature_row,
     load_combiner, magnitude_inputs, option_stats_values, parse_questionnaire, run_questionnaire,
 )
@@ -89,6 +90,70 @@ def test_sampling_is_nested_and_independent_of_other_quarters() -> None:
     assert T.sample_rows(list(reversed(rows)), "2026Q3", 100, 0) == small   # input order does not matter
     assert T.sample_rows(rows, "2026Q2", 100, 0) != small and T.sample_rows(rows, "2026Q3", 100, 1) != small
     assert T.sample_rows(rows, "2026Q3", 0, 0) == rows and T.sample_rows(rows[:50], "2026Q3", 100, 0) == rows[:50]
+
+
+def test_parse_preview_reply_and_prompt() -> None:
+    out = P.parse_preview_reply('{"overall_vs_note": 9, "scenario": null, "revenue_expected": "5.0"}')
+    assert set(out) == set(PREVIEW_QUESTION_KEYS) | set(PREVIEW_NUMBER_KEYS)
+    assert out["overall_vs_note"] == 5.0 and out["scenario"] is None and out["revenue_expected"] == 5.0
+    with pytest.raises(ValueError):
+        P.parse_preview_reply('{"revenue_expected": 5.0}')              # numbers alone are no answers
+    a, b = P.preview_prompt("event A"), P.preview_prompt("event B")
+    prefix = a[: a.index("=== EVENT MATERIALS ===")]
+    assert b.startswith(prefix) and all(f'"{k}"' in prefix for k in PREVIEW_NUMBER_KEYS)
+
+
+def test_run_preview_questionnaire_masks_and_uses_its_own_prompt() -> None:
+    client = FakeClient(['{"overall_vs_note": 3}'])
+    out = P.run_preview_questionnaire("Autodesk beat the note.", "ADSK", AgentSettings(),
+                                      company_name="Autodesk, Inc.", client=client)
+    assert out["overall_vs_note"] == 3.0
+    call = client.calls[0]
+    assert call["messages"][0]["content"] == P.PREVIEW_SYSTEM
+    assert "Autodesk" not in call["messages"][1]["content"]
+
+
+def test_preview_materials_and_bundle_flag() -> None:
+    bundle = {"items": [
+        {"id": "earnings-call-facts", "kind": "facts", "content": ["Revenue up 12%."]},
+        {"id": "earnings-preview", "kind": "text", "content": "Consensus is $5.0B."},
+        {"id": "option-implied-stats", "kind": "stats", "content": {
+            "implied_earnings_volatility": {"value": 0.07, "status": "ok"}}},
+    ]}
+    m = P.preview_materials(bundle)
+    assert "Consensus is $5.0B." in m and "Revenue up 12%." in m and "Implied" not in m
+    assert P.bundle_has_preview(bundle)
+    assert not P.bundle_has_preview({"items": [{"id": "earnings-preview", "content": "  "}]})
+    assert not P.bundle_has_preview({"items": []}) and not P.bundle_has_preview(None)
+    assert P.preview_materials(None) == ""
+
+
+def test_note_surprises_come_from_merged_facts_and_note_numbers() -> None:
+    row = P.feature_row({"overall": 1.0, "revenue_actual": 102.0, "eps_actual": 1.32},
+                        {"rev_growth_vol": 0.01, "last_close": 60.0}, None,
+                        preview_answers={"overall_vs_note": 2.0, "revenue_expected": 100.0,
+                                         "eps_expected": 1.20})
+    assert row["p_overall_vs_note"] == 2.0 and row["has_preview"] == 1.0
+    assert row["revenue_surprise_pct"] == pytest.approx(0.02)
+    assert row["revenue_surprise_z"] == pytest.approx(2.0)
+    assert row["eps_surprise_px"] == pytest.approx(0.12 / 60)
+    bare = P.feature_row({"overall": 1.0}, {}, None)
+    assert bare["has_preview"] == 0.0 and bare["revenue_surprise_pct"] is None
+    assert bare["p_overall_vs_note"] is None
+    # the explicit flag wins when the note exists but the call failed
+    assert P.feature_row({}, {}, None, has_preview=True)["has_preview"] == 1.0
+
+
+def test_load_combiner_checks_the_preview_version(tmp_path) -> None:
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps(COMBINER.to_dict() | {"preview_version": P.PREVIEW_QUESTIONNAIRE_VERSION}))
+    assert load_combiner(good) is not None
+    stale = tmp_path / "stale.json"
+    stale.write_text(json.dumps(COMBINER.to_dict() | {"preview_version": "p0"}))
+    assert load_combiner(stale) is None                                 # other preview questionnaire
+    plain = tmp_path / "plain.json"
+    plain.write_text(json.dumps(COMBINER.to_dict()))
+    assert load_combiner(plain) is not None                             # facts-only combiner still fine
 
 
 def test_average_answers_takes_the_median_of_numbers() -> None:
@@ -237,7 +302,8 @@ def test_derived_features_guard_against_units_and_metric_mixups() -> None:
                                     "guidance_metric": "revenue"}, {"rev_growth_vol": 0.05})
     assert rev_guide["guidance_change_pct"] == pytest.approx(0.7 / 19.5)
     assert rev_guide["guidance_change_z"] == pytest.approx(0.7 / 19.5 / 0.05)
-    assert P.derived_features(None, None) == {k: None for k in P.DERIVED_FEATURES}
+    assert P.derived_features(None, None) == {
+        k: None for k in (*P.DERIVED_FEATURES, *P.PREVIEW_DERIVED_FEATURES)}
 
 
 def test_revenue_growth_volatility_from_quarterly_filings() -> None:
@@ -411,7 +477,8 @@ def test_fold_without_a_feature_still_gives_finite_combiner() -> None:
     assert np.all(np.isfinite(T.predict_rows(c, rows)))
 
 
-def _archive_file(path: Path, quarter_events: list[tuple[str, int]], seed: int = 1) -> None:
+def _archive_file(path: Path, quarter_events: list[tuple[str, int]], seed: int = 1,
+                  preview_every: int = 0) -> None:
     rng = random.Random(seed)
     with gzip.open(path, "wt", encoding="utf-8") as fh:
         for i in range(quarter_events[0][1]):
@@ -419,6 +486,10 @@ def _archive_file(path: Path, quarter_events: list[tuple[str, int]], seed: int =
             surprise = rng.gauss(0, 1)
             car = 0.02 * surprise + 0.015 * guide + rng.gauss(0, 0.03)
             ticker = f"T{i:03d}"
+            items = [{"id": "earnings-call-facts", "kind": "facts",
+                      "content": [f"GUIDE={guide}", f"{ticker} reported."]}]
+            if preview_every and i % preview_every == 0:
+                items.append({"id": "earnings-preview", "kind": "text", "content": f"NOTE for {ticker}."})
             fh.write(json.dumps({
                 "event_id": f"{quarter_events[0][0]}-{i}", "event_type": "EARNINGS_RELEASE",
                 "event_datetime": "2026-08-20T21:00:00Z", "knowledge_cutoff": "2026-08-20T20:00:00Z",
@@ -426,8 +497,7 @@ def _archive_file(path: Path, quarter_events: list[tuple[str, int]], seed: int =
                 "event_returns": {ticker: {"car1": car, "window_start_date": "2026-08-20",
                                            "window_end_date": "2026-08-21"}},
                 "metrics": {"earnings_surprise": {"surprise": surprise, "surprise_status": "ok"}},
-                "disclosure": {"items": [{"id": "earnings-call-facts", "kind": "facts",
-                                          "content": [f"GUIDE={guide}", f"{ticker} reported."]}]},
+                "disclosure": {"items": items},
             }) + "\n")
 
 
@@ -501,6 +571,62 @@ def test_holdout_quarter_is_scored_but_never_trained_on(tmp_path, monkeypatch, c
     assert "HOLDOUT 2026Q3" in capsys.readouterr().out
 
 
+def test_training_asks_the_preview_questionnaire_only_where_there_is_a_note(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(T, "CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setattr(T, "MODEL_PATH", tmp_path / "model" / "combiner.json")
+    monkeypatch.setattr(T, "BUNDLE_COPY", tmp_path / "bundle" / "combiner.json")
+    monkeypatch.setenv("AGENT_STORE_DIR", str(tmp_path / "store"))
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "")
+    monkeypatch.setenv("AGENT_ONLINE", "0")
+    monkeypatch.setenv("AGENT_USE_CALENDAR", "0")
+    f = tmp_path / "EARNINGS_RELEASE_2026Q3.jsonl.gz"
+    _archive_file(f, [("2026Q3", 80)], seed=2, preview_every=2)         # half the events carry a note
+
+    p_calls = []
+
+    def fake_facts(materials, ticker, settings, company_name=None):
+        guide = int(materials.split("GUIDE=")[1].split()[0])
+        return {k: None for k in QUESTION_KEYS} | {"guidance_change": float(guide), "overall": 0.0}
+
+    def fake_preview(materials, ticker, settings, company_name=None):
+        p_calls.append(materials)
+        assert "NOTE for" in materials and "GUIDE=" in materials        # it reads note AND facts
+        guide = int(materials.split("GUIDE=")[1].split()[0])
+        return {k: None for k in PREVIEW_QUESTION_KEYS} | {"overall_vs_note": float(guide)}
+
+    out = tmp_path / "model" / "combiner.json"
+    c = T.main(["--files", str(f), "--offline", "--lambdas", "1", "--powers", "0",
+                "--out", str(out)], questionnaire_fn=fake_facts, preview_fn=fake_preview)
+    assert len(p_calls) == 40                                           # only the events with a note
+    assert c.preview_version == P.PREVIEW_QUESTIONNAIRE_VERSION
+    names = set(c.features)
+    assert "p_overall_vs_note" in names and "has_preview" in names
+    loaded = load_combiner(out)
+    assert loaded is not None and loaded.preview_version == P.PREVIEW_QUESTIONNAIRE_VERSION
+
+    p_calls.clear()
+    T.main(["--files", str(f), "--offline", "--lambdas", "1", "--powers", "0", "--out", str(out),
+            "--fit-only"], questionnaire_fn=fake_facts, preview_fn=fake_preview)
+    assert p_calls == []                                                # second run: all from the cache
+
+    # --no-preview: the same rows as model A, none of the note's features
+    plain = T.main(["--files", str(f), "--offline", "--lambdas", "1", "--powers", "0", "--out", str(out),
+                    "--no-preview"], questionnaire_fn=fake_facts, preview_fn=fake_preview)
+    assert p_calls == [] and plain.preview_version is None
+    assert not any(n.startswith("p_") or n == "has_preview" for n in plain.features)
+
+
+def test_random_folds_mix_quarters_so_one_quarter_features_get_tested() -> None:
+    rows = [{"quarter": q, "i": i} for q in ("2026Q2", "2026Q3") for i in range(50)]
+    by_quarter = T.folds_for(rows, seed=0)
+    assert [f[0] for f in by_quarter] == ["2026Q2", "2026Q3"]
+    folds = T.folds_for(rows, seed=0, mode="random")
+    assert len(folds) == 5 and sorted(i for _, _, test in folds for i in test) == list(range(100))
+    for _, train, test in folds:
+        assert not set(train) & set(test)
+        assert {rows[i]["quarter"] for i in train} == {rows[i]["quarter"] for i in test} == {"2026Q2", "2026Q3"}
+
+
 # -- live pipeline ------------------------------------------------------------------
 
 EVENT = {"event_id": "e1", "event_type": "EARNINGS_RELEASE", "event_datetime": "2026-08-27T21:00:00Z",
@@ -558,6 +684,53 @@ def test_predict_falls_back_to_the_chain_when_the_combiner_step_breaks(monkeypat
     preds, traces = P.predict_with_trace(EVENT, _settings_with_combiner(tmp_path))
     assert preds[0]["predicted_percentile"] == 0.61
     assert "bug" in traces[0]["combiner_error"] and traces[0]["mode"] == "chain (combiner failed)"
+
+
+def test_predict_runs_both_questionnaires_when_the_note_is_there(monkeypatch, tmp_path) -> None:
+    pbundle = {"items": [*BUNDLE["items"],
+                         {"id": "earnings-preview", "kind": "text", "content": "The note."}]}
+
+    class _PResp:
+        def raise_for_status(self) -> None: ...
+        def json(self) -> dict: return pbundle
+
+    monkeypatch.setattr(P.httpx, "get", lambda *a, **k: _PResp())
+    monkeypatch.setattr(P, "run_questionnaire",
+                        lambda materials, ticker, settings, company_name=None:
+                        {"overall": 4.0, "revenue_actual": 102.0})
+    monkeypatch.setattr(P, "run_preview_questionnaire",
+                        lambda materials, ticker, settings, company_name=None:
+                        {"overall_vs_note": 2.0, "revenue_expected": 100.0})
+    preds, traces = P.predict_with_trace(EVENT, _settings_with_combiner(tmp_path))
+    t = traces[0]
+    assert t["preview_questionnaire"] == {"overall_vs_note": 2.0, "revenue_expected": 100.0}
+    assert t["features"]["p_overall_vs_note"] == 2.0 and t["features"]["has_preview"] == 1.0
+    assert t["features"]["revenue_surprise_pct"] == pytest.approx(0.02)
+    assert preds[0]["predicted_percentile"] == pytest.approx(
+        COMBINER.predict(t["features"], {"implied_move": 0.06})[0])
+
+
+def test_preview_failure_keeps_the_facts_prediction(monkeypatch, tmp_path) -> None:
+    pbundle = {"items": [*BUNDLE["items"],
+                         {"id": "earnings-preview", "kind": "text", "content": "The note."}]}
+
+    class _PResp:
+        def raise_for_status(self) -> None: ...
+        def json(self) -> dict: return pbundle
+
+    monkeypatch.setattr(P.httpx, "get", lambda *a, **k: _PResp())
+    monkeypatch.setattr(P, "run_questionnaire",
+                        lambda materials, ticker, settings, company_name=None: {"overall": 4.0})
+
+    def boom(*a, **k):
+        raise TimeoutError("note call down")
+
+    monkeypatch.setattr(P, "run_preview_questionnaire", boom)
+    preds, traces = P.predict_with_trace(EVENT, _settings_with_combiner(tmp_path))
+    assert "note call down" in traces[0]["preview_error"]
+    assert traces[0]["features"]["has_preview"] == 1.0                  # the flag still says: note existed
+    assert preds[0]["predicted_percentile"] == pytest.approx(
+        COMBINER.predict(traces[0]["features"], {"implied_move": 0.06})[0])
 
 
 def test_without_a_combiner_the_chain_path_is_unchanged(monkeypatch, tmp_path) -> None:

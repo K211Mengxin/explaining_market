@@ -13,6 +13,8 @@ store, see scripts/build_store.py):
     uv run python scripts/train_combiner.py --fit-only                   # refit from the cache only
     uv run python scripts/train_combiner.py --quarters 2025Q4,2026Q1,2026Q2 --limit 200 \\
         --holdout 2026Q3 --holdout-limit 600                             # train on three, test on Q3
+    uv run python scripts/train_combiner.py --quarters 2025Q4,2026Q1,2026Q2,2026Q3 --limit 600 \\
+        --holdout 2026Q4 --holdout-limit 600    # model B: Q3's notes train the preview features, Q4 tests
     uv run modal volume put em-agent-store scripts/data/bundle /bundle --force   # ship it
 
 Steps
@@ -66,8 +68,8 @@ load_dotenv(ROOT / ".env")  # DEEPSEEK_API_KEY, EM_API_KEY, SEC_USER_AGENT, like
 
 import predict as P  # noqa: E402
 from predict import (  # noqa: E402
-    FEATURE_NAMES, MAGNITUDE_KEYS, QUESTIONNAIRE_VERSION, AgentSettings, Combiner, feature_row, magnitude_inputs,
-    option_stats_values,
+    FEATURE_NAMES, MAGNITUDE_KEYS, PREVIEW_DERIVED_FEATURES, PREVIEW_QUESTIONNAIRE_VERSION, QUESTIONNAIRE_VERSION,
+    AgentSettings, Combiner, feature_row, magnitude_inputs, option_stats_values,
 )
 
 DATA = HERE / "data"
@@ -226,6 +228,12 @@ def questionnaire_cache(settings: AgentSettings) -> JsonlCache:
 CONTEXT_CACHE_VERSION = "v2"
 
 
+def preview_answer_cache(settings: AgentSettings) -> JsonlCache:
+    name = (f"preview_{PREVIEW_QUESTIONNAIRE_VERSION}_{_slug(settings.deepseek_model)}"
+            f"_n{settings.questionnaire_samples}_think-{settings.questionnaire_thinking}.jsonl")
+    return JsonlCache(CACHE_DIR / name)
+
+
 def context_cache() -> JsonlCache:
     return JsonlCache(CACHE_DIR / f"context_{CONTEXT_CACHE_VERSION}.jsonl")
 
@@ -239,12 +247,13 @@ def _event(rec: dict, ticker: str) -> dict:
             "focal_assets": [{"identifier_type": "TICKER", "identifier_value": ticker}]}
 
 
-def extract_one(row: dict, settings: AgentSettings, qcache: JsonlCache | None, ccache: JsonlCache,
-                *, ask: bool, refresh_context: bool, questionnaire_fn=None) -> dict:
+def extract_one(row: dict, settings: AgentSettings, qcache: JsonlCache | None, pcache: JsonlCache | None,
+                ccache: JsonlCache, *, ask: bool, refresh_context: bool,
+                questionnaire_fn=None, preview_fn=None) -> dict:
     """Questionnaire answers + context numbers for one archive row (cached)."""
     rec, ticker = row["_record"], row["ticker"]
     key = f"{rec['event_id']}|{ticker}"
-    out: dict = {"key": key}
+    out: dict = {"key": key, "has_preview": P.bundle_has_preview(rec.get("disclosure"))}
 
     c = None if refresh_context else ccache.get(key)
     if c is None and ask:
@@ -267,18 +276,33 @@ def extract_one(row: dict, settings: AgentSettings, qcache: JsonlCache | None, c
             qcache.put(key, q)
         out["answers"] = (q or {}).get("answers")
         out["q_error"] = (q or {}).get("error")
+    if pcache is not None and out["has_preview"]:
+        q = pcache.get(key)
+        if q is None and ask:
+            materials = P.preview_materials(rec["disclosure"])
+            name = (P.get_data(settings).sec.profiles().get(ticker.upper()) or {}).get("name")
+            fn = preview_fn or P.run_preview_questionnaire
+            try:
+                q = {"answers": fn(materials, ticker, settings, company_name=name), "error": None}
+            except Exception as exc:
+                q = {"answers": None, "error": f"{type(exc).__name__}: {exc}"[:300]}
+            pcache.put(key, q)
+        out["p_answers"] = (q or {}).get("answers")
+        out["p_error"] = (q or {}).get("error")
     return out
 
 
 def extract_all(rows: list[dict], settings: AgentSettings, *, workers: int, ask: bool, use_questionnaire: bool,
-                refresh_context: bool, questionnaire_fn=None) -> list[dict]:
+                refresh_context: bool, questionnaire_fn=None, preview_fn=None, use_preview: bool = True) -> list[dict]:
     qcache = questionnaire_cache(settings) if use_questionnaire else None
+    pcache = preview_answer_cache(settings) if use_questionnaire and use_preview else None
     ccache = context_cache()
     feats: dict[str, dict] = {}
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        futs = {pool.submit(extract_one, r, settings, qcache, ccache, ask=ask, refresh_context=refresh_context,
-                            questionnaire_fn=questionnaire_fn): r for r in rows}
+        futs = {pool.submit(extract_one, r, settings, qcache, pcache, ccache, ask=ask,
+                            refresh_context=refresh_context, questionnaire_fn=questionnaire_fn,
+                            preview_fn=preview_fn): r for r in rows}
         for i, fut in enumerate(as_completed(futs), 1):
             r = futs[fut]
             try:
@@ -294,9 +318,10 @@ def extract_all(rows: list[dict], settings: AgentSettings, *, workers: int, ask:
             continue
         options = option_stats_values(r["_record"].get("disclosure"))
         out.append({**{k: v for k, v in r.items() if k != "_record"},
-                    "features": feature_row(f.get("answers"), f.get("ctx_data"), options),
+                    "features": feature_row(f.get("answers"), f.get("ctx_data"), options,
+                                            preview_answers=f.get("p_answers"), has_preview=f.get("has_preview")),
                     "mags": magnitude_inputs(f.get("ctx_data"), options),
-                    "q_error": f.get("q_error")})
+                    "q_error": f.get("q_error"), "p_error": f.get("p_error")})
     return out
 
 
@@ -378,7 +403,7 @@ def magnitude_factors(rows: list[dict], cfg: dict | None) -> np.ndarray:
 
 
 def fit(rows: list[dict], names: list[str], lam: float, *, power: float = 0.0, joint: bool = True,
-        scale_sd: float = 0.10, meta: dict | None = None) -> Combiner:
+        scale_sd: float = 0.10, preview_version: str | None = None, meta: dict | None = None) -> Combiner:
     """Ridge weights for the live formula  0.5 + scale * g * (z . w),  g = (m / m_ref) ** power.
 
     joint=True  fits the weights on the features multiplied by g, the quantity the live
@@ -401,7 +426,7 @@ def fit(rows: list[dict], names: list[str], lam: float, *, power: float = 0.0, j
     scale = scale_sd / z_sd if z_sd > 1e-12 else 1.0
     return Combiner(tuple(names), tuple(map(float, means)), tuple(map(float, stds)), tuple(map(float, beta)),
                     scale=scale, center=0.5, magnitude=cfg,
-                    questionnaire_version=QUESTIONNAIRE_VERSION, meta=meta or {})
+                    questionnaire_version=QUESTIONNAIRE_VERSION, preview_version=preview_version, meta=meta or {})
 
 
 def predict_rows(c: Combiner, rows: list[dict]) -> np.ndarray:
@@ -412,9 +437,14 @@ def score(pred: np.ndarray, rows: list[dict]) -> float | None:
     return delta_r2(pred, [r["s"] for r in rows], [r["y"] for r in rows])
 
 
-def folds_for(rows: list[dict], seed: int, k_random: int = 5) -> list[tuple[str, list[int], list[int]]]:
+def folds_for(rows: list[dict], seed: int, k_random: int = 5,
+              mode: str = "quarter") -> list[tuple[str, list[int], list[int]]]:
+    """mode "quarter": leave one quarter out (the honest test of carrying weights to a new
+    quarter). mode "random": k folds over events, mixing quarters - needed when a feature
+    exists in one quarter only (the research note), which quarter folds can never both
+    train and test on."""
     quarters = sorted({r["quarter"] for r in rows})
-    if len(quarters) >= 2:
+    if mode == "quarter" and len(quarters) >= 2:
         return [(q, [i for i, r in enumerate(rows) if r["quarter"] != q],
                  [i for i, r in enumerate(rows) if r["quarter"] == q]) for q in quarters]
     idx = list(range(len(rows)))
@@ -428,9 +458,10 @@ def _cv_label(lam: float, power: float, joint: bool) -> str:
     return f"{lam}|p={power}|{'none' if not power else 'joint' if joint else 'after'}"
 
 
-def cross_validate(rows: list[dict], names: list[str], lambdas, seed: int, powers=DEFAULT_POWERS) -> dict:
+def cross_validate(rows: list[dict], names: list[str], lambdas, seed: int, powers=DEFAULT_POWERS,
+                   mode: str = "quarter") -> dict:
     """Held-out delta R^2 per fold for every (lambda, exponent, joint-or-after) setting."""
-    folds = folds_for(rows, seed)
+    folds = folds_for(rows, seed, mode=mode)
     table: dict[tuple[float, float, bool], list[float]] = defaultdict(list)
     for label, train_i, test_i in folds:
         train, test = [rows[i] for i in train_i], [rows[i] for i in test_i]
@@ -539,7 +570,7 @@ def report_holdout(combiner: Combiner, hold: list[dict], seed: int) -> dict:
     return out
 
 
-def main(argv: list[str] | None = None, *, questionnaire_fn=None) -> Combiner | None:
+def main(argv: list[str] | None = None, *, questionnaire_fn=None, preview_fn=None) -> Combiner | None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--list", action="store_true", help="list archive quarters and exit")
     ap.add_argument("--quarters", help="comma list, e.g. 2026Q2,2026Q3 (default: all)")
@@ -557,6 +588,11 @@ def main(argv: list[str] | None = None, *, questionnaire_fn=None) -> Combiner | 
     ap.add_argument("--min-coverage", type=float, default=0.05, help="drop features present on fewer rows")
     ap.add_argument("--fit-only", action="store_true", help="never call the LLM or build context; use caches")
     ap.add_argument("--no-questionnaire", action="store_true", help="context features only")
+    ap.add_argument("--no-preview", action="store_true",
+                    help="ablation: no preview questionnaire and none of its features (model A)")
+    ap.add_argument("--cv", choices=("quarter", "random"), default="quarter",
+                    help="folds: leave one quarter out (default), or random over events - use random "
+                         "when training includes the one quarter that has research notes")
     ap.add_argument("--refresh-context", action="store_true", help="recompute cached context features")
     ap.add_argument("--offline", action="store_true", help="context from the store only (no price/SEC fetches)")
     ap.add_argument("--out", type=Path, default=MODEL_PATH)
@@ -595,9 +631,15 @@ def main(argv: list[str] | None = None, *, questionnaire_fn=None) -> Combiner | 
           f"(questionnaire {QUESTIONNAIRE_VERSION if use_q else 'off'}, model {settings.deepseek_model}, "
           f"samples {settings.questionnaire_samples}, thinking {settings.questionnaire_thinking}) ...")
     data = extract_all(rows, settings, workers=args.workers, ask=not args.fit_only, use_questionnaire=use_q,
-                       refresh_context=args.refresh_context, questionnaire_fn=questionnaire_fn)
+                       refresh_context=args.refresh_context, questionnaire_fn=questionnaire_fn,
+                       preview_fn=preview_fn, use_preview=not args.no_preview)
     failed = sum(1 for r in data if use_q and r["features"].get("q_overall") is None)
-    print(f"{len(data)} rows ready; questionnaire missing on {failed}")
+    n_prev = sum(1 for r in data if r["features"].get("has_preview") == 1.0)
+    ask_preview = use_q and not args.no_preview
+    p_failed = sum(1 for r in data if r["features"].get("has_preview") == 1.0
+                   and r["features"].get("p_overall_vs_note") is None) if ask_preview else 0
+    print(f"{len(data)} rows ready; questionnaire missing on {failed}; {n_prev} rows have a research note"
+          + (f", preview questionnaire missing on {p_failed}" if ask_preview else " (preview questionnaire off)"))
     u = P.QUESTIONNAIRE_USAGE
     if u["calls"]:
         n = u["calls"]
@@ -609,12 +651,14 @@ def main(argv: list[str] | None = None, *, questionnaire_fn=None) -> Combiner | 
     hold = [r for r in data if r["quarter"] == args.holdout]
     data = [r for r in data if r["quarter"] != args.holdout]
     names, coverage = choose_features(data, args.min_coverage)
+    if args.no_preview or not use_q:
+        names = [n for n in names if not (n.startswith("p_") or n in PREVIEW_DERIVED_FEATURES or n == "has_preview")]
     lambdas = [float(x) for x in args.lambdas.split(",") if x.strip()]
     powers = [float(x) for x in args.powers.split(",") if x.strip()]
     print("\nreference points:")
     report_baselines(data)
     if len(data) >= MIN_ROWS_FOR_CV:
-        cv = cross_validate(data, names, lambdas, args.seed, powers)
+        cv = cross_validate(data, names, lambdas, args.seed, powers, mode=args.cv)
         print(f"\ncross-validation over {cv['folds']} (held-out delta R^2, mean over folds; "
               "p = magnitude exponent, 0 = no scaling):")
         for key, v in cv["table"].items():
@@ -634,7 +678,11 @@ def main(argv: list[str] | None = None, *, questionnaire_fn=None) -> Combiner | 
             "lambda": cv["lambda"], "cv": cv, "coverage": {n: round(coverage[n], 3) for n in names},
             "dropped": sorted(set(FEATURE_NAMES) - set(names))}
     meta["magnitude_power"], meta["magnitude_joint"] = cv["power"], cv["joint"]
-    combiner = fit(data, names, cv["lambda"], power=cv["power"], joint=cv["joint"], meta=meta)
+    uses_preview = any(n.startswith("p_") or n in PREVIEW_DERIVED_FEATURES for n in names)
+    meta["preview_version"] = PREVIEW_QUESTIONNAIRE_VERSION if uses_preview else None
+    meta["n_preview_rows"] = n_prev
+    combiner = fit(data, names, cv["lambda"], power=cv["power"], joint=cv["joint"], meta=meta,
+                   preview_version=PREVIEW_QUESTIONNAIRE_VERSION if uses_preview else None)
 
     print("\nweights (per standard deviation; sorted by size):")
     for n, w in sorted(zip(combiner.features, combiner.weights), key=lambda t: -abs(t[1])):

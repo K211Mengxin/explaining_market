@@ -21,7 +21,9 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
-from predict import FACTS_ID, NUMBER_KEYS, OPTION_STATS_ID, PREVIEW_ID, QUESTION_KEYS  # noqa: E402
+from predict import (  # noqa: E402
+    FACTS_ID, NUMBER_KEYS, OPTION_STATS_ID, PREVIEW_ID, PREVIEW_NUMBER_KEYS, PREVIEW_QUESTION_KEYS, QUESTION_KEYS,
+)
 
 ARCHIVE = HERE / "data" / "archive"
 CACHE_DIR = HERE / "data" / "combiner"
@@ -71,7 +73,11 @@ def main() -> None:
     if not events:
         print("   no archive files under", ARCHIVE)
 
-    for cache in sorted(CACHE_DIR.glob("questionnaire_*.jsonl")):
+    for cache in sorted([*CACHE_DIR.glob("questionnaire_*.jsonl"), *CACHE_DIR.glob("preview_*.jsonl")]):
+        is_preview = cache.name.startswith("preview_")
+        qkeys = PREVIEW_QUESTION_KEYS if is_preview else QUESTION_KEYS
+        nkeys = PREVIEW_NUMBER_KEYS if is_preview else NUMBER_KEYS
+        overall_key = "overall_vs_note" if is_preview else "overall"
         rows = [json.loads(line) for line in cache.read_text(encoding="utf-8").splitlines() if line.strip()]
         latest = {r["key"]: r for r in rows}
         print(f"\n2. {cache.name}: {len(latest)} events")
@@ -89,16 +95,16 @@ def main() -> None:
         cols = [g for g in groups if groups[g]]
         print("   share of answers that are NULL:")
         print(f"   {'item':<26}" + "".join(f"{g + ' (n=' + str(len(groups[g])) + ')':>24}" for g in cols))
-        for item in (*QUESTION_KEYS, *NUMBER_KEYS):
+        for item in (*qkeys, *nkeys):
             print(f"   {item:<26}" + "".join(
                 f"{sum(a.get(item) is None for a in groups[g]) / len(groups[g]):>24.0%}" for g in cols))
 
         shown = 0
         for key, r in latest.items():
             a, ev = r.get("answers"), events.get(key)
-            if a and ev and a.get("overall") is None and shown < 3:
+            if a and ev and a.get(overall_key) is None and shown < 3:
                 shown += 1
-                print(f"\n3. overall is null: {key} ({ev['quarter']}, preview: {ev['preview']})")
+                print(f"\n3. {overall_key} is null: {key} ({ev['quarter']}, preview: {ev['preview']})")
                 for fact in ev["facts"][:10]:
                     print("     -", str(fact)[:200])
                 print("     answers:", {k: v for k, v in a.items() if v is not None})

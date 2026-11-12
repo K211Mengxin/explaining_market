@@ -103,6 +103,10 @@ def main() -> None:
         print("answers:", json.dumps(trace.get("questionnaire"), indent=2))
         if trace.get("questionnaire_error"):
             print("questionnaire error:", trace["questionnaire_error"])
+        if trace.get("preview_questionnaire") or trace.get("preview_error"):
+            print("versus the research note:", json.dumps(trace.get("preview_questionnaire"), indent=2))
+            if trace.get("preview_error"):
+                print("preview questionnaire error:", trace["preview_error"])
         print("features:", json.dumps({k: v for k, v in (trace.get("features") or {}).items() if v is not None},
                                       indent=2))
         print(f"combiner: {trace.get('combiner')}  llm={trace.get('llm_seconds')}s")

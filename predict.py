@@ -2385,9 +2385,8 @@ def _finite(v: object) -> float | None:
     return None
 
 
-def parse_questionnaire(text: str) -> dict:
-    """The model's JSON reply -> {item: value clipped to its scale, or None} plus the
-    copied numbers and the guidance metric.
+def _parse_reply(text: str, questions: tuple[Question, ...], number_keys: tuple[str, ...]) -> dict:
+    """A model's JSON reply -> {item: value clipped to its scale, or None} + copied numbers.
 
     Raises when there is no JSON object or not a single usable answer, so the
     caller can tell a failed call from an event the materials say nothing about.
@@ -2399,30 +2398,43 @@ def parse_questionnaire(text: str) -> dict:
     if not isinstance(raw, dict):
         raise ValueError("questionnaire reply is not a JSON object")
     out: dict[str, float | str | None] = {}
-    for q in QUESTIONS:
+    for q in questions:
         v = _finite(raw.get(q.key))
         out[q.key] = None if v is None else float(min(q.hi, max(q.lo, v)))
-    if all(out[k] is None for k in QUESTION_KEYS):
+    if all(out[q.key] is None for q in questions):
         raise ValueError("questionnaire reply has no usable answers")
-    for key in NUMBER_KEYS:
+    for key in number_keys:
         v = _finite(raw.get(key))
         out[key] = v if v is not None and abs(v) < 1e15 else None
-    metric = raw.get("guidance_metric")
+    return out
+
+
+def parse_questionnaire(text: str) -> dict:
+    """The facts questionnaire's reply, plus the guidance metric."""
+    raw = json.loads(re.search(r"\{.*\}", text or "{}", re.DOTALL).group(0)) if re.search(
+        r"\{.*\}", text or "", re.DOTALL) else {}
+    out = _parse_reply(text, QUESTIONS, NUMBER_KEYS)
+    metric = raw.get("guidance_metric") if isinstance(raw, dict) else None
     out["guidance_metric"] = metric.strip().lower() if isinstance(metric, str) and \
         metric.strip().lower() in GUIDANCE_METRICS else None
     return out
 
 
-def average_answers(answers: list[dict]) -> dict:
-    """Several questionnaire replies -> one: the mean of each scored item, the median of
-    each copied number (robust to one reply in the wrong units), the most common metric."""
+def _average(answers: list[dict], question_keys: tuple[str, ...], number_keys: tuple[str, ...]) -> dict:
+    """Several replies -> one: the mean of each scored item, the median of each copied
+    number (robust to one reply in the wrong units)."""
     out: dict[str, float | str | None] = {}
-    for key in QUESTION_KEYS:
+    for key in question_keys:
         vals = [a[key] for a in answers if a.get(key) is not None]
         out[key] = statistics.fmean(vals) if vals else None
-    for key in NUMBER_KEYS:
+    for key in number_keys:
         vals = [a[key] for a in answers if a.get(key) is not None]
         out[key] = statistics.median(vals) if vals else None
+    return out
+
+
+def average_answers(answers: list[dict]) -> dict:
+    out = _average(answers, QUESTION_KEYS, NUMBER_KEYS)
     metrics = [a["guidance_metric"] for a in answers if a.get("guidance_metric")]
     out["guidance_metric"] = max(set(metrics), key=metrics.count) if metrics else None
     return out
@@ -2472,39 +2484,152 @@ def _thinking_kwargs(level: str) -> dict:
     return {"extra_body": {"thinking": {"type": "enabled"}}, "reasoning_effort": level}
 
 
-def _ask_questionnaire(client, settings: AgentSettings, materials: str) -> dict[str, float | None]:
+def _ask_llm(client, settings: AgentSettings, system: str, user: str) -> str:
     kwargs = _thinking_kwargs(settings.questionnaire_thinking)
     if settings.deepseek_temperature is not None:
         kwargs["temperature"] = settings.deepseek_temperature
     resp = client.chat.completions.create(
         model=settings.deepseek_model,
-        messages=[{"role": "system", "content": QUESTIONNAIRE_SYSTEM},
-                  {"role": "user", "content": questionnaire_prompt(materials)}],
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
         response_format={"type": "json_object"},
         **kwargs,
     )
     _record_usage(getattr(resp, "usage", None))
-    return parse_questionnaire(resp.choices[0].message.content or "")
+    return resp.choices[0].message.content or ""
 
 
-def run_questionnaire(materials: str, ticker: str, settings: AgentSettings, *,
-                      company_name: str | None = None, client=None) -> dict[str, float | None]:
-    """Fill in the questionnaire (averaged over AGENT_Q_SAMPLES calls). Raises if every call fails."""
+def _ask_questionnaire(client, settings: AgentSettings, materials: str) -> dict[str, float | None]:
+    return parse_questionnaire(_ask_llm(client, settings, QUESTIONNAIRE_SYSTEM, questionnaire_prompt(materials)))
+
+
+def _run_sampled(materials: str, ticker: str, settings: AgentSettings, company_name, client, ask, averager):
     text = anonymize(materials, ticker, company_name)
     client = client or _questionnaire_client(settings)
     n = max(1, settings.questionnaire_samples)
     if n == 1:
-        return _ask_questionnaire(client, settings, text)
+        return ask(client, settings, text)
     answers, last_error = [], None
     with ThreadPoolExecutor(max_workers=n) as pool:
-        for fut in [pool.submit(_ask_questionnaire, client, settings, text) for _ in range(n)]:
+        for fut in [pool.submit(ask, client, settings, text) for _ in range(n)]:
             try:
                 answers.append(fut.result())
             except Exception as exc:
                 last_error = exc
     if not answers:
         raise last_error or RuntimeError("questionnaire failed")
-    return average_answers(answers)
+    return averager(answers)
+
+
+def run_questionnaire(materials: str, ticker: str, settings: AgentSettings, *,
+                      company_name: str | None = None, client=None) -> dict[str, float | None]:
+    """Fill in the facts questionnaire (averaged over AGENT_Q_SAMPLES calls). Raises if every call fails."""
+    return _run_sampled(materials, ticker, settings, company_name, client, _ask_questionnaire, average_answers)
+
+
+# ----------------------------------------------------------------------------
+# 12b. preview questionnaire ("model B")
+# ----------------------------------------------------------------------------
+# A SECOND, separate call, made only for events that carry a research note
+# (earnings-preview), which the archive has from 2026Q3 on and live events now
+# carry almost always. It reads the note AND the facts and grades the release
+# against the note's own expectations - the information the facts questionnaire
+# cannot see. Its features are missing (and weightless) on events without a
+# note; the combiner learns their weights from the quarters that have one.
+
+PREVIEW_QUESTIONNAIRE_VERSION = "p1"
+
+PREVIEW_QUESTIONS: tuple[Question, ...] = (
+    Question("revenue_vs_note", -2, 2,
+             "Reported revenue versus the note's revenue estimate: +2 clearly above, +1 slightly above, "
+             "0 in line, -1 slightly below, -2 clearly below. null if the note states no revenue "
+             "estimate."),
+    Question("guidance_vs_note", -2, 2,
+             "The guidance the company gave versus what the note expected or implied for guidance: "
+             "+2 clearly better, 0 as expected, -2 clearly worse. null if the note says nothing "
+             "about guidance."),
+    Question("key_metrics_vs_note", -2, 2,
+             "The key metrics the note says to watch (in the note's own ranking): how the reported "
+             "figures came in against the note's expectations for THOSE metrics, +2 clearly better "
+             "to -2 clearly worse."),
+    Question("scenario", -2, 2,
+             "Which of the note's scenarios the release matches: +2 its most bullish, +1 between base "
+             "and bull, 0 its base case, -1 between base and bear, -2 its most bearish. null if the "
+             "note lays out no scenarios."),
+    Question("beyond_note", -2, 2,
+             "Material news in the release that the note did NOT anticipate: +2 clearly positive, "
+             "+1 somewhat positive, 0 none or balanced, -1 somewhat negative, -2 clearly negative."),
+    Question("overall_vs_note", -5, 5,
+             "Overall, how did the release come in versus the expectations in the note: +5 far "
+             "better, 0 in line, -5 far worse. ALWAYS answer this item with an integer, never null."),
+)
+PREVIEW_QUESTION_KEYS: tuple[str, ...] = tuple(q.key for q in PREVIEW_QUESTIONS)
+
+PREVIEW_NUMBER_FIELDS: tuple[tuple[str, str], ...] = (
+    ("revenue_expected", "the note's revenue estimate (consensus) for the quarter, in the units "
+                         "the note states"),
+    ("eps_expected", "the note's EPS estimate (consensus) for the quarter"),
+)
+PREVIEW_NUMBER_KEYS: tuple[str, ...] = tuple(k for k, _ in PREVIEW_NUMBER_FIELDS)
+
+PREVIEW_SYSTEM = """\
+You are an equity analyst. You get a research note written BEFORE one company's earnings
+release (expectations, key metrics to watch, scenarios) and the factual bullet points of
+the release itself. Grade how the release came in AGAINST THE NOTE'S EXPECTATIONS.
+
+Rules:
+- Part A: answer every item strictly on its own scale, as an integer.
+- "overall_vs_note" must ALWAYS be an integer, never null.
+- For the other items, use null only when the note does not cover that item.
+- Part B: copy the note's estimates exactly as stated. Do not compute, convert or estimate.
+- The company is referred to as "the company"; do not try to identify it.
+
+Respond with JSON only, with exactly the keys listed, e.g. {"revenue_vs_note": 1, ...}.
+"""
+
+
+def _preview_items() -> str:
+    items = "\n".join(f'{i}. "{q.key}" (integer {q.lo} to {q.hi}, or null): {q.text}'
+                      for i, q in enumerate(PREVIEW_QUESTIONS, start=1))
+    numbers = "\n".join(f'- "{k}" (number or null): {desc}' for k, desc in PREVIEW_NUMBER_FIELDS)
+    return f"Part A, the release versus the note:\n{items}\n\nPart B, numbers copied from the note:\n{numbers}"
+
+
+def preview_prompt(materials: str) -> str:
+    """Fixed part FIRST, the event's materials LAST (DeepSeek's context cache)."""
+    return (f"{_preview_items()}\n\nThe research note and the release facts follow. Read them, then "
+            f"return the JSON object.\n\n=== EVENT MATERIALS ===\n{materials}\n=== END ===")
+
+
+def bundle_has_preview(bundle: object) -> bool:
+    items = bundle.get("items") if isinstance(bundle, dict) else None
+    for item in items if isinstance(items, list) else []:
+        if isinstance(item, dict) and item.get("id") == PREVIEW_ID:
+            content = item.get("content")
+            return isinstance(content, str) and bool(content.strip())
+    return False
+
+
+def preview_materials(bundle: object) -> str:
+    """What the preview questionnaire reads: the note (the chain's cut) plus the facts."""
+    return format_materials(bundle, include_options=False) if bundle is not None else ""
+
+
+def parse_preview_reply(text: str) -> dict:
+    return _parse_reply(text, PREVIEW_QUESTIONS, PREVIEW_NUMBER_KEYS)
+
+
+def average_preview_answers(answers: list[dict]) -> dict:
+    return _average(answers, PREVIEW_QUESTION_KEYS, PREVIEW_NUMBER_KEYS)
+
+
+def _ask_preview(client, settings: AgentSettings, materials: str) -> dict[str, float | None]:
+    return parse_preview_reply(_ask_llm(client, settings, PREVIEW_SYSTEM, preview_prompt(materials)))
+
+
+def run_preview_questionnaire(materials: str, ticker: str, settings: AgentSettings, *,
+                              company_name: str | None = None, client=None) -> dict[str, float | None]:
+    """Grade the release against the research note (averaged over AGENT_Q_SAMPLES calls)."""
+    return _run_sampled(materials, ticker, settings, company_name, client, _ask_preview, average_preview_answers)
 
 
 # ============================================================================
@@ -2540,11 +2665,18 @@ CONTEXT_FEATURES: tuple[str, ...] = (
 DERIVED_FEATURES: tuple[str, ...] = (
     "growth_accel_pp", "growth_accel_z", "guidance_change_pct", "guidance_change_z",
 )
-FEATURE_NAMES: tuple[str, ...] = tuple(f"q_{k}" for k in QUESTION_KEYS) + DERIVED_FEATURES + CONTEXT_FEATURES
+# Surprises vs the research note's estimates: the note's expected numbers (p1) paired
+# with the actual numbers the facts questionnaire copied (q4). Missing without a note.
+PREVIEW_DERIVED_FEATURES: tuple[str, ...] = ("revenue_surprise_pct", "revenue_surprise_z", "eps_surprise_px")
+FEATURE_NAMES: tuple[str, ...] = (tuple(f"q_{k}" for k in QUESTION_KEYS)
+                                  + tuple(f"p_{k}" for k in PREVIEW_QUESTION_KEYS)
+                                  + DERIVED_FEATURES + PREVIEW_DERIVED_FEATURES
+                                  + CONTEXT_FEATURES + ("has_preview",))
 
 MAX_REL_CHANGE = 0.5      # |new / previous - 1| beyond this is almost surely a units mix-up
 MAX_GROWTH_ACCEL = 0.75   # |growth acceleration| beyond 75 points: same (revenue copied as growth)
 MAX_YOY_PCT = 400         # a copied "growth percent" beyond this is not a percent
+MAX_PRICE_SURPRISE = 0.2  # |EPS surprise| beyond 20% of the share price: a basis or units mix-up
 MIN_GROWTH_VOL = 0.01     # floor of the company scale, so a very steady company cannot explode z
 MAX_Z = 10.0
 # Unsigned size-of-reaction measures, in order of preference.
@@ -2585,6 +2717,10 @@ def derived_features(answers: dict | None, ctx_data: dict | None) -> dict[str, f
                         (fundamentals.rev_growth_vol): "how unusual for THIS company"
     guidance_change_pct new / previous guidance midpoint - 1 (revenue or unspecified metric)
     guidance_change_z   ... on the same company scale (revenue guidance only)
+    revenue_surprise_pct revenue actual (facts, q4) / the note's estimate (p1) - 1
+    revenue_surprise_z  ... on the same company scale
+    eps_surprise_px     (EPS actual - the note's estimate) / last close: price scaling,
+                        sane when the expected EPS is near zero
     """
     a, d = answers or {}, ctx_data or {}
     yoy_pct = _finite(a.get("revenue_yoy_pct"))
@@ -2602,16 +2738,26 @@ def derived_features(answers: dict | None, ctx_data: dict | None) -> dict[str, f
     def z(x: float | None) -> float | None:
         return None if x is None or scale is None else max(-MAX_Z, min(MAX_Z, x / scale))
 
+    rev_s = _rel_change(_finite(a.get("revenue_actual")), _finite(a.get("revenue_expected")))
+    eps_a, eps_e, px = _finite(a.get("eps_actual")), _finite(a.get("eps_expected")), _finite(d.get("last_close"))
+    eps_px = None
+    if eps_a is not None and eps_e is not None and px and px > 0:
+        eps_px = (eps_a - eps_e) / px
+        eps_px = eps_px if abs(eps_px) <= MAX_PRICE_SURPRISE else None
     return {"growth_accel_pp": accel, "growth_accel_z": z(accel), "guidance_change_pct": guide,
-            "guidance_change_z": z(guide) if metric == "revenue" else None}
+            "guidance_change_z": z(guide) if metric == "revenue" else None,
+            "revenue_surprise_pct": rev_s, "revenue_surprise_z": z(rev_s), "eps_surprise_px": eps_px}
 
 
-def feature_row(answers: dict | None, ctx_data: dict | None, options: dict | None) -> dict[str, float | None]:
+def feature_row(answers: dict | None, ctx_data: dict | None, options: dict | None,
+                preview_answers: dict | None = None, has_preview: bool | None = None) -> dict[str, float | None]:
     """Named features for the combiner. The ONLY place features are defined, so the
     training script and the live pipeline cannot drift apart."""
-    answers, d, options = answers or {}, ctx_data or {}, options or {}
+    answers, p, d, options = answers or {}, preview_answers or {}, ctx_data or {}, options or {}
     row: dict[str, float | None] = {f"q_{k}": _finite(answers.get(k)) for k in QUESTION_KEYS}
-    row.update(derived_features(answers, d))
+    row.update({f"p_{k}": _finite(p.get(k)) for k in PREVIEW_QUESTION_KEYS})
+    row.update(derived_features({**p, **answers}, d))
+    row["has_preview"] = 1.0 if (bool(p) if has_preview is None else has_preview) else 0.0
     for key in ("abn_ret_5d", "abn_ret_20d", "abn_ret_60d", "pos_52w", "peer_mean_car", "sector_mean_car",
                 "rev_yoy", "op_margin", "accruals", "earnings_yield"):
         row[key] = _finite(d.get(key))
@@ -2640,6 +2786,7 @@ class Combiner:
     center: float = 0.5
     magnitude: dict | None = None         # {"base", "ratios", "ref", "power"} or None
     questionnaire_version: str = QUESTIONNAIRE_VERSION
+    preview_version: str | None = None    # set when the combiner uses preview features
     meta: dict = field(default_factory=dict)
 
     @classmethod
@@ -2660,7 +2807,7 @@ class Combiner:
         if mag is not None and not (mag.get("base") in MAGNITUDE_KEYS and float(mag.get("ref", 0)) > 0):
             raise ValueError("combiner magnitude block is invalid")
         return cls(names, means, stds, weights, float(d.get("scale", 1.0)), float(d.get("center", 0.5)),
-                   mag, d.get("questionnaire_version", ""), d.get("meta") or {})
+                   mag, d.get("questionnaire_version", ""), d.get("preview_version"), d.get("meta") or {})
 
     def to_dict(self) -> dict:
         return {
@@ -2668,7 +2815,8 @@ class Combiner:
             "questionnaire_version": self.questionnaire_version,
             "features": [{"name": n, "mean": m, "std": s, "weight": w}
                          for n, m, s, w in zip(self.features, self.means, self.stds, self.weights)],
-            "scale": self.scale, "center": self.center, "magnitude": self.magnitude, "meta": self.meta,
+            "scale": self.scale, "center": self.center, "magnitude": self.magnitude,
+            "preview_version": self.preview_version, "meta": self.meta,
         }
 
     def linear(self, row: dict[str, float | None]) -> tuple[float, int]:
@@ -2723,6 +2871,12 @@ def load_combiner(path: Path) -> Combiner | None:
         if combiner.questionnaire_version != QUESTIONNAIRE_VERSION:
             print(f"[WARN] combiner {path} was trained on questionnaire {combiner.questionnaire_version!r}, "
                   f"this code asks {QUESTIONNAIRE_VERSION!r}; retrain it. Using the single-score chain.")
+            combiner = None
+        elif combiner is not None and combiner.preview_version is not None \
+                and combiner.preview_version != PREVIEW_QUESTIONNAIRE_VERSION:
+            print(f"[WARN] combiner {path} was trained on preview questionnaire "
+                  f"{combiner.preview_version!r}, this code asks {PREVIEW_QUESTIONNAIRE_VERSION!r}; "
+                  "retrain it. Using the single-score chain.")
             combiner = None
     except Exception as exc:
         print(f"[WARN] combiner {path} is unusable ({type(exc).__name__}: {exc}); using the single-score chain.")
@@ -2910,18 +3064,21 @@ def _predict_with_combiner(event: dict, ticker: str, materials: str, bundle: obj
     """Questionnaire (LLM, on the text) and context (numbers) in parallel -> combiner."""
     data = get_data(settings)
     name = (data.sec.profiles().get(ticker.upper()) or {}).get("name")
-    pool = ThreadPoolExecutor(max_workers=1)
+    has_prev = bundle_has_preview(bundle)
+    pool = ThreadPoolExecutor(max_workers=2)
     t0 = time.monotonic()
     try:
         q_future = pool.submit(run_questionnaire, questionnaire_materials(bundle), ticker, settings,
                                company_name=name) if bundle is not None else None
+        p_future = pool.submit(run_preview_questionnaire, preview_materials(bundle), ticker, settings,
+                               company_name=name) if has_prev else None
         try:
             context = build_context(event, ticker, settings, data)
         except Exception as exc:
             context = EventContext(ticker=ticker, cutoff=event.get("knowledge_cutoff", ""))
             context.errors["context"] = f"{type(exc).__name__}: {exc}"
         trace["_context"] = context  # reused by the chain if the combiner step fails
-        answers = None
+        answers = p_answers = None
         if q_future is None:
             trace["questionnaire_error"] = "no materials"
         else:
@@ -2929,15 +3086,20 @@ def _predict_with_combiner(event: dict, ticker: str, materials: str, bundle: obj
                 answers = q_future.result(timeout=2 * settings.questionnaire_timeout_s + 10)
             except Exception as exc:  # the numeric features still carry signal
                 trace["questionnaire_error"] = f"{type(exc).__name__}: {exc}"[:300]
+        if p_future is not None:
+            try:
+                p_answers = p_future.result(timeout=2 * settings.questionnaire_timeout_s + 10)
+            except Exception as exc:  # the facts features still carry the event
+                trace["preview_error"] = f"{type(exc).__name__}: {exc}"[:300]
     finally:
         pool.shutdown(wait=False)
     trace["llm_seconds"] = round(time.monotonic() - t0, 2)
 
     options = option_stats_values(bundle)
-    row = feature_row(answers, context.data, options)
+    row = feature_row(answers, context.data, options, preview_answers=p_answers, has_preview=has_prev)
     p, info = combiner.predict(row, magnitude_inputs(context.data, options))
     trace.pop("_context", None)
     trace.update(cutoff=context.cutoff, context=context.to_prompt(), context_data=context.data,
                  context_errors=context.errors, timings=context.timings,
-                 questionnaire=answers, features=row, combiner=info)
+                 questionnaire=answers, preview_questionnaire=p_answers, features=row, combiner=info)
     return p
