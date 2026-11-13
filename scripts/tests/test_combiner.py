@@ -453,6 +453,32 @@ def test_both_fits_match_the_live_formula() -> None:
     assert not np.allclose(c.weights, plain.weights)                    # joint fit really differs
 
 
+def test_option_postprocessing_equals_our_sqrt_scaling_when_every_row_has_options(capsys) -> None:
+    rows = synthetic_rows(n_per_quarter=300, seed=7)
+    train = [r for r in rows if r["quarter"] != "2026Q3"]
+    hold = [r for r in rows if r["quarter"] == "2026Q3"]
+    names, _ = T.choose_features(train, 0.05)
+    c = T.fit(train, names, 0.1, power=0.5, joint=False)
+    out = T.report_postprocessing(c, train, hold, seed=0)
+    v = out["variants"]
+    assert set(v) == {"none", "built-in", "option", "stacked"}
+    # same square root, same mean move, pivot = 0.5: the teammate's scaling IS our built-in one here
+    assert out["reference"]["none"]["pivot"] == pytest.approx(0.5, abs=1e-3)
+    assert v["option"]["delta_r2"] == pytest.approx(v["built-in"]["delta_r2"], abs=2e-3)
+    assert v["built-in"]["delta_r2"] > v["none"]["delta_r2"]          # size matters in this data
+    assert v["stacked"]["minus_builtin_ci90"] is not None and v["built-in"]["minus_builtin_ci90"] is None
+    assert out["holdout_rows_with_option_move"] == len(hold)
+    assert "POST-PROCESSING" in capsys.readouterr().out
+
+
+def test_option_postprocessing_leaves_rows_without_options_alone() -> None:
+    ref = T._fit_option_reference([{"p": 0.4, "move": 0.05}, {"p": 0.6, "move": 0.15}, {"p": 0.5, "move": None}])
+    assert ref["pivot"] == pytest.approx(0.5) and ref["move_mean"] == pytest.approx(0.10) and ref["n_moves"] == 2
+    assert T._adjust_percentile(0.7, None, ref) == 0.7
+    assert T._adjust_percentile(0.7, 0.40, ref) == pytest.approx(0.9)   # 0.5 + 0.2 * sqrt(4)
+    assert T._adjust_percentile(0.9, 0.90, ref) == 1.0                  # clipped
+
+
 def test_cross_validation_can_choose_no_scaling() -> None:
     rows = synthetic_rows(n_per_quarter=200, seed=5)
     for r in rows:                                    # magnitude now unrelated to the outcome
@@ -568,7 +594,44 @@ def test_holdout_quarter_is_scored_but_never_trained_on(tmp_path, monkeypatch, c
     assert hold["quarter"] == "2026Q3" and hold["n"] == 50 and hold["delta_r2"] > 0
     assert hold["ci90"][0] <= hold["delta_r2"] <= hold["ci90"][1]
     assert json.loads(out.read_text())["meta"]["holdout"]["n"] == 50
+    assert set(hold["postprocessing"]["variants"]) == {"none", "built-in", "option", "stacked"}
     assert "HOLDOUT 2026Q3" in capsys.readouterr().out
+
+
+def test_a_grown_holdout_quarter_is_scored_on_the_events_already_paid_for(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(T, "CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setattr(T, "MODEL_PATH", tmp_path / "model" / "combiner.json")
+    monkeypatch.setattr(T, "BUNDLE_COPY", tmp_path / "bundle" / "combiner.json")
+    monkeypatch.setenv("AGENT_STORE_DIR", str(tmp_path / "store"))
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "")
+    monkeypatch.setenv("AGENT_ONLINE", "0")
+    monkeypatch.setenv("AGENT_USE_CALENDAR", "0")
+    files = []
+    for i, q in enumerate(("2026Q1", "2026Q2", "2026Q3")):
+        f = tmp_path / f"EARNINGS_RELEASE_{q}.jsonl.gz"
+        _archive_file(f, [(q, 90)], seed=i + 1)
+        files.append(f)
+    asked = []
+
+    def fake_questionnaire(materials, ticker, settings, company_name=None):
+        asked.append(ticker)
+        guide = int(materials.split("GUIDE=")[1].split()[0])
+        return {k: None for k in QUESTION_KEYS} | {"guidance_change": float(guide), "overall": 0.0}
+
+    args = ["--files", *map(str, files), "--offline", "--lambdas", "1", "--powers", "0", "--limit", "60",
+            "--holdout", "2026Q3", "--holdout-limit", "50", "--out", str(tmp_path / "c.json")]
+    T.main(args, questionnaire_fn=fake_questionnaire)
+    paid = {k for k in T.questionnaire_cache(P.AgentSettings.from_env()).data if k.startswith("2026Q3")}
+    assert len(paid) == 50
+    _archive_file(files[2], [("2026Q3", 150)], seed=3)       # the unsealed quarter grew: same 90 + 60 new
+    capsys.readouterr()
+    T.main([*args, "--fit-only"])                             # same --holdout-limit, a re-drawn sample
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "HOLDOUT rows have NO questionnaire answer" in out
+    c = T.main([*args, "--fit-only", "--holdout-from-cache"])
+    out = capsys.readouterr().out
+    assert "50 of 150 trainable outcomes already have questionnaire answers" in out and "WARNING" not in out
+    assert c.meta["holdout"]["n"] == 50
 
 
 def test_training_asks_the_preview_questionnaire_only_where_there_is_a_note(tmp_path, monkeypatch) -> None:

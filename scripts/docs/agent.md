@@ -138,6 +138,14 @@ uv run python scripts/train_combiner.py --quarters 2025Q4,2026Q1,2026Q2 --limit 
 # Add --no-preview for model A on the same rows (the note's increment = the difference).
 uv run python scripts/train_combiner.py --quarters 2025Q4,2026Q1,2026Q2,2026Q3 --limit 600 \
     --holdout 2026Q4 --holdout-limit 600 --cv random
+# every --holdout run also prints POST-PROCESSING: the same weights with no scaling, our
+# scaling, no scaling + the option-only square-root calibration (scripts/calibration.py if
+# present, else a copy), and both stacked, each with a paired interval against ours. Free with
+# --fit-only.
+# Q4 is unsealed and keeps growing, and a grown quarter re-draws its sample, so the
+# --holdout-limit 600 rows are no longer the 600 already paid for. Re-score those, free:
+uv run python scripts/train_combiner.py --quarters 2025Q4,2026Q1,2026Q2,2026Q3 --limit 600 \
+    --holdout 2026Q4 --cv random --fit-only --holdout-from-cache
 uv run python scripts/train_combiner.py --no-questionnaire  # ablation: context numbers only
 # 3. upload the bundle (includes combiner.json)
 uv run modal volume put em-agent-store scripts/data/bundle /bundle --force

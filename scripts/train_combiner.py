@@ -15,6 +15,7 @@ store, see scripts/build_store.py):
         --holdout 2026Q3 --holdout-limit 600                             # train on three, test on Q3
     uv run python scripts/train_combiner.py --quarters 2025Q4,2026Q1,2026Q2,2026Q3 --limit 600 \\
         --holdout 2026Q4 --holdout-limit 600    # model B: Q3's notes train the preview features, Q4 tests
+    #   Q4 is unsealed and keeps growing; re-scoring later, add --fit-only --holdout-from-cache
     uv run modal volume put em-agent-store scripts/data/bundle /bundle --force   # ship it
 
 Steps
@@ -52,6 +53,7 @@ import time
 import warnings
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -491,7 +493,9 @@ def cross_validate(rows: list[dict], names: list[str], lambdas, seed: int, power
 def sample_rows(rows: list[dict], quarter: str, limit: int, seed: int) -> list[dict]:
     """`limit` rows of a quarter, NESTED: a larger limit keeps every row of a smaller one, and a
     quarter's sample does not depend on which other quarters are requested. So a run can be
-    extended (--limit 150 -> 300) and every questionnaire answer already paid for is reused."""
+    extended (--limit 150 -> 300) and every questionnaire answer already paid for is reused.
+    Only while the quarter itself stays the same: an unsealed quarter that gains events re-draws
+    almost the whole sample (use --holdout-from-cache to score the events already paid for)."""
     if not limit or len(rows) <= limit:
         return rows
     order = sorted(rows, key=lambda r: (r["event_id"], r["ticker"]))
@@ -570,6 +574,95 @@ def report_holdout(combiner: Combiner, hold: list[dict], seed: int) -> dict:
     return out
 
 
+# ------------------------------------------------- option-based post-processing ---
+# A teammate's calibration.py rescales a percentile with the official notebook's square root:
+# p' = pivot + (p - pivot) * sqrt(move / mean training move), move = the option-implied
+# absolute earnings move; an event without one keeps p. If that file sits in scripts/ it is
+# used as is; otherwise this copy of its two functions is.
+
+def _fit_option_reference(training_rows) -> dict:
+    rows = list(training_rows)
+    if not rows or any(not _finite_num(r.get("p")) or not 0 <= r["p"] <= 1 for r in rows):
+        raise ValueError("training rows need a percentile p in [0, 1]")
+    moves = [r["move"] for r in rows if _finite_num(r.get("move")) and r["move"] > 0]
+    return {"pivot": sum(r["p"] for r in rows) / len(rows),
+            "move_mean": sum(moves) / len(moves) if moves else None,
+            "n_predictions": len(rows), "n_moves": len(moves)}
+
+
+def _adjust_percentile(p, move, reference) -> float:
+    mu, mean_move = reference.get("pivot"), reference.get("move_mean")
+    if not _finite_num(move) or move <= 0 or not _finite_num(mean_move) or mean_move <= 0:
+        return float(p)
+    return max(0.0, min(1.0, mu + (p - mu) * (move / mean_move) ** 0.5))
+
+
+def _finite_num(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and bool(np.isfinite(x))
+
+
+def option_calibration():
+    """(fit_option_reference, adjust_percentile, source): the teammate's file when present."""
+    try:
+        from calibration import adjust_percentile, fit_option_reference  # scripts/calibration.py
+        return fit_option_reference, adjust_percentile, "scripts/calibration.py"
+    except ImportError:
+        return _fit_option_reference, _adjust_percentile, "copy in train_combiner.py"
+
+
+def report_postprocessing(combiner: Combiner, train: list[dict], hold: list[dict], seed: int) -> dict:
+    """The same fitted weights scored on the holdout four ways, each against our current output:
+
+      none      no magnitude scaling at all
+      built-in  our scaling as trained (CV-chosen exponent; proxies when there are no options)
+      option    no scaling + the teammate's option-only square-root scaling
+      stacked   our scaling + the teammate's on top (what applying it to our output gives)
+
+    The teammate's reference (pivot, mean move) is fitted on the TRAINING rows only. With
+    weights fitted jointly with the scaling, "none" drops a scaling the weights assumed.
+    Picking the best of four on the holdout and reporting that score is mildly optimistic."""
+    fit_ref, adjust, source = option_calibration()
+    unscaled = replace(combiner, magnitude=None)
+    moves_tr = [r["mags"].get("implied_move") for r in train]
+    moves_ho = [r["mags"].get("implied_move") for r in hold]
+    base_tr, base_ho = predict_rows(unscaled, train), predict_rows(unscaled, hold)
+    ours_tr, ours_ho = predict_rows(combiner, train), predict_rows(combiner, hold)
+    ref_none = fit_ref({"p": float(p), "move": m} for p, m in zip(base_tr, moves_tr))
+    ref_ours = fit_ref({"p": float(p), "move": m} for p, m in zip(ours_tr, moves_tr))
+    variants = {
+        "none": base_ho,
+        "built-in": ours_ho,
+        "option": np.array([adjust(float(p), m, ref_none) for p, m in zip(base_ho, moves_ho)]),
+        "stacked": np.array([adjust(float(p), m, ref_ours) for p, m in zip(ours_ho, moves_ho)]),
+    }
+    s, y = np.array([r["s"] for r in hold]), np.array([r["y"] for r in hold])
+    n_move = sum(1 for m in moves_ho if _finite_num(m) and m > 0)
+    out: dict = {"source": source, "holdout_rows_with_option_move": n_move,
+                 "reference": {"none": ref_none, "built-in": ref_ours}, "variants": {}}
+    mean_move = ref_none["move_mean"]
+    print(f"\nPOST-PROCESSING on the holdout (same weights; option scaling from {source}):")
+    print(f"  {n_move}/{len(hold)} holdout rows have an option-implied move; training mean move "
+          + (f"{mean_move:.4f} from {ref_none['n_moves']} rows" if mean_move else "unknown (no training row has one)"))
+    mag = combiner.magnitude
+    print("  built-in = " + (f"exponent {mag['power']}, base {mag['base']}" if mag else "no scaling (CV chose none)"))
+    ref = variants["built-in"]
+    for name, pred in variants.items():
+        d = delta_r2(pred, s, y)
+        ci = _bootstrap(lambda i, pred=pred: delta_r2(pred[i], s[i], y[i]), len(hold), seed)
+
+        def diff(i, pred=pred):
+            a, b = delta_r2(pred[i], s[i], y[i]), delta_r2(ref[i], s[i], y[i])
+            return None if a is None or b is None else a - b
+
+        ci_d = None if name == "built-in" else _bootstrap(diff, len(hold), seed)
+        out["variants"][name] = {"delta_r2": d, "ci90": ci, "minus_builtin_ci90": ci_d}
+        span = f"  90% [{ci[0]:+.4f}, {ci[1]:+.4f}]" if ci else ""
+        vs = f"   minus built-in: 90% [{ci_d[0]:+.4f}, {ci_d[1]:+.4f}]" if ci_d else ""
+        print(f"  {name:<10} dR2={d:+.4f}{span}{vs}")
+    print("  (decide on one variant before reading these; picking the best of four is mildly optimistic)")
+    return out
+
+
 def main(argv: list[str] | None = None, *, questionnaire_fn=None, preview_fn=None) -> Combiner | None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--list", action="store_true", help="list archive quarters and exit")
@@ -580,6 +673,9 @@ def main(argv: list[str] | None = None, *, questionnaire_fn=None, preview_fn=Non
     ap.add_argument("--holdout", help="a quarter kept out of fitting AND tuning, scored at the end, e.g. 2026Q3")
     ap.add_argument("--holdout-limit", type=int, default=None,
                     help="events sampled from the holdout quarter (default: --limit)")
+    ap.add_argument("--holdout-from-cache", action="store_true",
+                    help="holdout = every holdout-quarter event that already has a questionnaire answer "
+                         "(ignores --holdout-limit; for an unsealed quarter that grew since it was paid for)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--lambdas", default=",".join(map(str, DEFAULT_LAMBDAS)))
@@ -615,11 +711,20 @@ def main(argv: list[str] | None = None, *, questionnaire_fn=None, preview_fn=Non
     # 1-2. archive and targets
     rows: list[dict] = []
     hold_limit = args.limit if args.holdout_limit is None else args.holdout_limit
+    if args.holdout_from_cache and not (args.holdout and use_q):
+        sys.exit("--holdout-from-cache needs --holdout and the questionnaire")
     for quarter, records in load_quarters(args):
         is_hold = quarter == args.holdout
-        q_rows = sample_rows(trainable(outcome_rows(records, quarter)), quarter,
-                             hold_limit if is_hold else args.limit, args.seed)
-        print(f"{quarter}: {len(q_rows)} trainable outcomes" + ("  [HOLDOUT]" if is_hold else ""))
+        everything = trainable(outcome_rows(records, quarter))
+        if is_hold and args.holdout_from_cache:
+            # the events whose answers were already paid for, wherever the sample would land today
+            asked = questionnaire_cache(settings).data
+            q_rows = [r for r in everything if f"{r['event_id']}|{r['ticker']}" in asked]
+            print(f"{quarter}: {len(q_rows)} of {len(everything)} trainable outcomes already have questionnaire "
+                  "answers; scoring those  [HOLDOUT]")
+        else:
+            q_rows = sample_rows(everything, quarter, hold_limit if is_hold else args.limit, args.seed)
+            print(f"{quarter}: {len(q_rows)} trainable outcomes" + ("  [HOLDOUT]" if is_hold else ""))
         rows.extend(q_rows)
     if not [r for r in rows if r["quarter"] != args.holdout]:
         sys.exit("no trainable outcomes (need a car1, a surprise and a disclosure)")
@@ -640,6 +745,16 @@ def main(argv: list[str] | None = None, *, questionnaire_fn=None, preview_fn=Non
                    and r["features"].get("p_overall_vs_note") is None) if ask_preview else 0
     print(f"{len(data)} rows ready; questionnaire missing on {failed}; {n_prev} rows have a research note"
           + (f", preview questionnaire missing on {p_failed}" if ask_preview else " (preview questionnaire off)"))
+    if use_q and failed:
+        for label, part in (("training", [r for r in data if r["quarter"] != args.holdout]),
+                            ("HOLDOUT", [r for r in data if r["quarter"] == args.holdout])):
+            miss = sum(1 for r in part if r["features"].get("q_overall") is None)
+            if part and miss / len(part) > 0.02:
+                why = (" --fit-only never asks, so these were never paid for: an unsealed quarter that grew "
+                       "since then re-draws its sample" + (" (add --holdout-from-cache)" if label == "HOLDOUT" else "")
+                       if args.fit_only else " the calls failed; re-run to retry them")
+                print(f"\n[!] WARNING: {miss}/{len(part)} {label} rows have NO questionnaire answer and are "
+                      f"predicted from the context numbers alone, which drags the score down.\n    {why}\n")
     u = P.QUESTIONNAIRE_USAGE
     if u["calls"]:
         n = u["calls"]
@@ -693,6 +808,7 @@ def main(argv: list[str] | None = None, *, questionnaire_fn=None, preview_fn=Non
     print(f"in-sample delta R^2 (optimistic): {score(predict_rows(combiner, data), data):+.4f}")
     if hold:
         meta["holdout"] = report_holdout(combiner, hold, args.seed)
+        meta["holdout"]["postprocessing"] = report_postprocessing(combiner, data, hold, args.seed)
 
     # 5. save
     args.out.parent.mkdir(parents=True, exist_ok=True)
