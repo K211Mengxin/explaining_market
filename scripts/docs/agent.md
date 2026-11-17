@@ -107,6 +107,12 @@ are tied to it; a combiner trained on another version is ignored (falls back to 
   `peer_mean_car`, `sector_mean_car`, `rev_yoy`, `op_margin`, `accruals`, `earnings_yield`,
   `log_market_cap`, `skew_25d`, `has_options`). Features present on < 5 % of training rows are
   dropped. A missing value sits at the training mean (contributes 0).
+* Winsorisation: before standardising, every feature is capped at its 1st / 99th percentile
+  over the training rows (`--winsorize 0.01`, default; `0` turns it off). The bounds are saved
+  per feature in `combiner.json` (`lo`, `hi`) and the live combiner caps a new event's values
+  at the same bounds, so one wrong input (e.g. a stale share count giving an absurd earnings
+  yield) cannot swamp the score. Inside cross-validation each fold computes its own bounds.
+  A combiner without bounds (trained before this) predicts exactly as before.
 * Magnitude (`implied_move`, else `own_mean_abs_car`, `peer_mean_abs_car`, `vol_60d`, each
   converted to the base measure's scale by a median ratio) has no direction, so it is not a
   linear feature. It stretches the prediction away from the centre by `(m / m_ref) ** p`

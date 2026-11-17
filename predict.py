@@ -2788,6 +2788,17 @@ class Combiner:
     questionnaire_version: str = QUESTIONNAIRE_VERSION
     preview_version: str | None = None    # set when the combiner uses preview features
     meta: dict = field(default_factory=dict)
+    # Winsorisation bounds per feature (the training rows' low/high percentiles): a value
+    # outside them is capped at the bound before standardising, so one wrong input (e.g.
+    # a stale share count giving an absurd earnings yield) cannot swamp the score.
+    # None (or a None entry) = no bound, which is how combiners trained before this read.
+    lows: tuple[float | None, ...] | None = None
+    highs: tuple[float | None, ...] | None = None
+
+    def bounds(self, i: int) -> tuple[float | None, float | None]:
+        lo = self.lows[i] if self.lows and i < len(self.lows) else None
+        hi = self.highs[i] if self.highs and i < len(self.highs) else None
+        return lo, hi
 
     @classmethod
     def from_dict(cls, d: dict) -> Combiner:
@@ -2806,25 +2817,45 @@ class Combiner:
         mag = d.get("magnitude")
         if mag is not None and not (mag.get("base") in MAGNITUDE_KEYS and float(mag.get("ref", 0)) > 0):
             raise ValueError("combiner magnitude block is invalid")
+        lows = tuple(_finite(f.get("lo")) for f in feats)
+        highs = tuple(_finite(f.get("hi")) for f in feats)
+        if any(lo is not None and hi is not None and lo > hi for lo, hi in zip(lows, highs)):
+            raise ValueError("combiner has a winsorisation bound with lo > hi")
         return cls(names, means, stds, weights, float(d.get("scale", 1.0)), float(d.get("center", 0.5)),
-                   mag, d.get("questionnaire_version", ""), d.get("preview_version"), d.get("meta") or {})
+                   mag, d.get("questionnaire_version", ""), d.get("preview_version"), d.get("meta") or {},
+                   lows if any(v is not None for v in lows) else None,
+                   highs if any(v is not None for v in highs) else None)
 
     def to_dict(self) -> dict:
+        feats = []
+        for i, (n, m, s, w) in enumerate(zip(self.features, self.means, self.stds, self.weights)):
+            f = {"name": n, "mean": m, "std": s, "weight": w}
+            lo, hi = self.bounds(i)
+            if lo is not None:
+                f["lo"] = lo
+            if hi is not None:
+                f["hi"] = hi
+            feats.append(f)
         return {
             "format": COMBINER_FORMAT,
             "questionnaire_version": self.questionnaire_version,
-            "features": [{"name": n, "mean": m, "std": s, "weight": w}
-                         for n, m, s, w in zip(self.features, self.means, self.stds, self.weights)],
+            "features": feats,
             "scale": self.scale, "center": self.center, "magnitude": self.magnitude,
             "preview_version": self.preview_version, "meta": self.meta,
         }
 
     def linear(self, row: dict[str, float | None]) -> tuple[float, int]:
-        """Weighted sum of standardised features; a missing feature sits at its mean (adds 0)."""
+        """Weighted sum of standardised features; a missing feature sits at its mean (adds 0).
+        Each value is first capped at the feature's winsorisation bounds, if any."""
         z, present = 0.0, 0
-        for name, mean, std, w in zip(self.features, self.means, self.stds, self.weights):
+        for i, (name, mean, std, w) in enumerate(zip(self.features, self.means, self.stds, self.weights)):
             v = _finite(row.get(name))
             if v is not None:
+                lo, hi = self.bounds(i)
+                if lo is not None and v < lo:
+                    v = lo
+                if hi is not None and v > hi:
+                    v = hi
                 z += w * (v - mean) / std
                 present += 1
         return z, present

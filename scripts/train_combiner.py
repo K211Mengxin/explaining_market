@@ -85,6 +85,10 @@ DEFAULT_LAMBDAS = (0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0)
 # option-statistics notebook's choice.
 DEFAULT_POWERS = (0.0, 0.25, 0.5, 0.75, 1.0)
 MIN_ROWS_FOR_CV = 40
+# Winsorisation: each feature is capped at its 1st / 99th percentile over the training
+# rows (bounds saved in combiner.json and applied live). On the 2025Q4-2026Q3 -> 2026Q4
+# comparison it raised holdout delta R^2 from 0.096 to 0.107 with everything else equal.
+DEFAULT_WINSORIZE = 0.01
 
 
 # ---------------------------------------------------------- official scoring ---
@@ -402,8 +406,16 @@ def magnitude_factors(rows: list[dict], cfg: dict | None) -> np.ndarray:
     return np.array([1.0 if (m := probe.magnitude_of(r["mags"])) is None else (m / ref) ** power for r in rows])
 
 
+def winsor_bounds(X: np.ndarray, q: float) -> tuple[np.ndarray, np.ndarray]:
+    """Per-column q / 1-q percentiles of the non-missing values (NaN for an all-missing column)."""
+    with np.errstate(all="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return np.nanpercentile(X, 100 * q, axis=0), np.nanpercentile(X, 100 * (1 - q), axis=0)
+
+
 def fit(rows: list[dict], names: list[str], lam: float, *, power: float = 0.0, joint: bool = True,
-        scale_sd: float = 0.10, preview_version: str | None = None, meta: dict | None = None) -> Combiner:
+        scale_sd: float = 0.10, preview_version: str | None = None, meta: dict | None = None,
+        winsorize: float = DEFAULT_WINSORIZE) -> Combiner:
     """Ridge weights for the live formula  0.5 + scale * g * (z . w),  g = (m / m_ref) ** power.
 
     joint=True  fits the weights on the features multiplied by g, the quantity the live
@@ -412,8 +424,18 @@ def fit(rows: list[dict], names: list[str], lam: float, *, power: float = 0.0, j
                 notebook's recipe). Joint fitting also gives high-magnitude events more
                 pull on the weights, which helps or hurts depending on the noise, so
                 cross-validation chooses. power = 0 means no scaling (g = 1).
+
+    winsorize=q caps every feature at its q / 1-q percentiles over these rows BEFORE
+    standardising; the bounds are stored in the combiner and applied to live rows the
+    same way. 0 turns it off. Inside cross_validate each fold computes its own bounds.
     """
     X = _matrix(rows, names)
+    lows = highs = None
+    if winsorize and winsorize > 0 and X.size:
+        lo, hi = winsor_bounds(X, winsorize)
+        X = np.clip(X, np.where(np.isfinite(lo), lo, -np.inf), np.where(np.isfinite(hi), hi, np.inf))
+        lows = tuple(float(v) if np.isfinite(v) else None for v in lo)
+        highs = tuple(float(v) if np.isfinite(v) else None for v in hi)
     Z, means, stds = _standardise(X)
     cfg = magnitude_config(rows, power) if power > 0 else None
     g = magnitude_factors(rows, cfg)
@@ -426,7 +448,8 @@ def fit(rows: list[dict], names: list[str], lam: float, *, power: float = 0.0, j
     scale = scale_sd / z_sd if z_sd > 1e-12 else 1.0
     return Combiner(tuple(names), tuple(map(float, means)), tuple(map(float, stds)), tuple(map(float, beta)),
                     scale=scale, center=0.5, magnitude=cfg,
-                    questionnaire_version=QUESTIONNAIRE_VERSION, preview_version=preview_version, meta=meta or {})
+                    questionnaire_version=QUESTIONNAIRE_VERSION, preview_version=preview_version, meta=meta or {},
+                    lows=lows, highs=highs)
 
 
 def predict_rows(c: Combiner, rows: list[dict]) -> np.ndarray:
@@ -459,7 +482,7 @@ def _cv_label(lam: float, power: float, joint: bool) -> str:
 
 
 def cross_validate(rows: list[dict], names: list[str], lambdas, seed: int, powers=DEFAULT_POWERS,
-                   mode: str = "quarter") -> dict:
+                   mode: str = "quarter", winsorize: float = DEFAULT_WINSORIZE) -> dict:
     """Held-out delta R^2 per fold for every (lambda, exponent, joint-or-after) setting."""
     folds = folds_for(rows, seed, mode=mode)
     table: dict[tuple[float, float, bool], list[float]] = defaultdict(list)
@@ -470,7 +493,8 @@ def cross_validate(rows: list[dict], names: list[str], lambdas, seed: int, power
                 continue  # too few rows with any magnitude measure
             for joint in ((True,) if not power else (True, False)):
                 for lam in lambdas:
-                    d = score(predict_rows(fit(train, names, lam, power=power, joint=joint), test), test)
+                    d = score(predict_rows(fit(train, names, lam, power=power, joint=joint,
+                                               winsorize=winsorize), test), test)
                     if d is not None:
                         table[(lam, power, joint)].append(d)
     n_folds = len(folds)
@@ -595,6 +619,9 @@ def main(argv: list[str] | None = None, *, questionnaire_fn=None, preview_fn=Non
                          "when training includes the one quarter that has research notes")
     ap.add_argument("--refresh-context", action="store_true", help="recompute cached context features")
     ap.add_argument("--offline", action="store_true", help="context from the store only (no price/SEC fetches)")
+    ap.add_argument("--winsorize", type=float, default=DEFAULT_WINSORIZE,
+                    help="cap each feature at this lower / upper percentile of the training rows "
+                         "(0.01 = 1st/99th; 0 = off)")
     ap.add_argument("--out", type=Path, default=MODEL_PATH)
     args = ap.parse_args(argv)
 
@@ -658,7 +685,7 @@ def main(argv: list[str] | None = None, *, questionnaire_fn=None, preview_fn=Non
     print("\nreference points:")
     report_baselines(data)
     if len(data) >= MIN_ROWS_FOR_CV:
-        cv = cross_validate(data, names, lambdas, args.seed, powers, mode=args.cv)
+        cv = cross_validate(data, names, lambdas, args.seed, powers, mode=args.cv, winsorize=args.winsorize)
         print(f"\ncross-validation over {cv['folds']} (held-out delta R^2, mean over folds; "
               "p = magnitude exponent, 0 = no scaling):")
         for key, v in cv["table"].items():
@@ -681,8 +708,10 @@ def main(argv: list[str] | None = None, *, questionnaire_fn=None, preview_fn=Non
     uses_preview = any(n.startswith("p_") or n in PREVIEW_DERIVED_FEATURES for n in names)
     meta["preview_version"] = PREVIEW_QUESTIONNAIRE_VERSION if uses_preview else None
     meta["n_preview_rows"] = n_prev
+    meta["winsorize"] = args.winsorize
     combiner = fit(data, names, cv["lambda"], power=cv["power"], joint=cv["joint"], meta=meta,
-                   preview_version=PREVIEW_QUESTIONNAIRE_VERSION if uses_preview else None)
+                   preview_version=PREVIEW_QUESTIONNAIRE_VERSION if uses_preview else None,
+                   winsorize=args.winsorize)
 
     print("\nweights (per standard deviation; sorted by size):")
     for n, w in sorted(zip(combiner.features, combiner.weights), key=lambda t: -abs(t[1])):
